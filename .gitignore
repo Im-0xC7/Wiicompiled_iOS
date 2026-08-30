@@ -72,3 +72,5 @@ project.lock.json
 *.log
 output.txt
 
+.DS_Store
+**/ios-build-*/
