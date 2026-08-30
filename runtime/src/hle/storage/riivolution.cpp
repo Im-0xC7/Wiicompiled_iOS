@@ -142,6 +142,12 @@ std::vector<RuntimeRiivolution::Overlay> RiivoDiscoverRoots() {
         !retroRewindRoot.empty()) {
         RiivoAddRoot(overlays, RuntimeNandPath::ResolveConfiguredPath(retroRewindRoot),
                      "canonical Retro Rewind installation");
+    } else if (RuntimeProduct::IsRetroRewind()) {
+        // No Config.toml entry - fall back to a RetroRewind6 folder bundled next to the
+        // executable, the way a packaged .app ships one (see RetroRewindOverlayPath).
+        if (const auto bundled = RuntimeNandPath::RetroRewindOverlayPath()) {
+            RiivoAddRoot(overlays, *bundled, "bundled Retro Rewind installation");
+        }
     }
 
     for (const auto& root : RecompMod::DvdOverlayRoots()) {

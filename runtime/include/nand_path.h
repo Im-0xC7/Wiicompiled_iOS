@@ -79,6 +79,22 @@ inline std::optional<std::filesystem::path> BootstrapPayloadPath() {
     return std::nullopt;
 }
 
+// Same "look next to the executable" idea as BootstrapPayloadPath, for a build that bundles its
+// own RetroRewind6 folder (an iOS .app can't be told an absolute retro_rewind_root at build time -
+// the sandboxed container path isn't known until install - and a Config.toml-relative one can't
+// reliably reach bundled .app resources either). Only a fallback: an explicit
+// [paths] retro_rewind_root in Config.toml still wins, see riivolution.cpp's RiivoDiscoverRoots.
+inline std::optional<std::filesystem::path> RetroRewindOverlayPath() {
+    if (auto executableDirectory = RuntimeConfigFile::ExecutableDirectory()) {
+        const auto adjacent = *executableDirectory / "RetroRewind6";
+        if (ExistingDirectory(adjacent) &&
+            std::filesystem::exists(adjacent / "Binaries" / "Code.pul")) {
+            return adjacent;
+        }
+    }
+    return std::nullopt;
+}
+
 inline bool CopyBootstrapFile(const std::filesystem::path& sourceRoot,
                               const std::filesystem::path& destinationRoot,
                               const std::filesystem::path& relativePath,

@@ -720,6 +720,17 @@ PLIST
     log_step "bundle-data-$target" "Bundling the extracted game data into $target"
     rsync -a --delete "$assets/DATA/" "$app_bundle/DATA/"
 
+    if [[ "$provenance_profile" == "retro-rewind" ]]; then
+        # Code.pul alone only gets the compiled function overrides - Retro Rewind also needs its
+        # menu archives/karts/drivers/courses live at runtime via a filesystem overlay (see
+        # riivolution.cpp's RiivoDiscoverRoots). Windows/Linux point that overlay straight at the
+        # user's own RetroRewind6 folder; there is no such persistent external path on iOS, so this
+        # bundles the whole folder into the .app instead, next to the executable, where
+        # RuntimeNandPath::RetroRewindOverlayPath() (nand_path.h) auto-discovers it.
+        log_step "bundle-retro-overlay-$target" "Bundling the Retro Rewind overlay into $target"
+        rsync -a --delete "$retro_root/" "$app_bundle/RetroRewind6/"
+    fi
+
     log_step "package-ipa-$target" "Packaging $target as an unsigned .ipa"
     local payload_dir=$build/Payload
     rm -rf "$payload_dir"
