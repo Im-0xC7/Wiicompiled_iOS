@@ -54,6 +54,17 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required tool '$1' was not found on PATH (override with --$2)"
 }
 
+to_absolute() {
+    # Unlike resolve_retro_rewind_dir's `cd ... && pwd -P`, this must not require the path to
+    # already exist - --output-dir/--base-output-dir are created later via mkdir -p. Needed
+    # because the packaging step's `(cd "$build" && zip ...)` would otherwise resolve a relative
+    # --output-dir against $build instead of the directory this script was invoked from.
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$PWD/$1" ;;
+    esac
+}
+
 sha256_of() {
     # macOS has no sha256sum; this script only ever runs on macOS (it drives Xcode's iOS
     # toolchain), so shasum -a 256 needs no Linux fallback the way local-build.sh's sha256_of does.
@@ -234,6 +245,9 @@ fi
 if [[ "$profile" != "both" && -n "$base_output_dir" ]]; then
     fail "--base-output-dir is valid only with --profile both."
 fi
+
+output_dir=$(to_absolute "$output_dir")
+[[ -n "$base_output_dir" ]] && base_output_dir=$(to_absolute "$base_output_dir")
 
 # ---------------------------------------------------------------------------
 # Tool resolution and prerequisite checks
