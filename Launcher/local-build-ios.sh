@@ -521,7 +521,13 @@ if (( builds_retro )); then
     if (( skip_retro_wfc_payload )); then
         translate_mod_args+=(--skip-retro-wfc)
     else
-        offline_payload=$retro_wfc_offline_dir/binary/payload.RMCPD00.bin
+        # --retro-wfc-payload is resolved by the translator against the project's workspace_root
+        # (Translator.Cli/Program.cs: `root = project?.WorkspaceRoot ?? Directory.GetCurrentDirectory()`,
+        # then `Path.Combine(root, spec)`), not against this script's invoking directory - so a
+        # relative --retro-wfc-offline-dir only worked by accident when run from the repo root.
+        # Canonicalizing here makes it absolute, which Path.Combine passes through unchanged.
+        assert_dir "$retro_wfc_offline_dir" "Offline Retro-WFC payload directory"
+        offline_payload=$(cd "$retro_wfc_offline_dir" && pwd -P)/binary/payload.RMCPD00.bin
         assert_file "$offline_payload" "Offline Retro-WFC shared payload"
         translate_mod_args+=(--retro-wfc-payload "$offline_payload")
     fi
