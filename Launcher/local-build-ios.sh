@@ -251,6 +251,13 @@ require_command "$ninja_bin" ninja
 require_command xcodebuild xcode
 require_command zip zip
 [[ -n "$retro_rewind_zip" ]] && require_command unzip unzip
+if [[ -n "$game_dump" ]]; then
+    # No generic "override with --nodtool" hint (require_command's default message) - unlike this
+    # script's other tools, nodtool has no prebuilt-release fetcher on macOS (NodToolProvider.cs's
+    # AssetName() only knows Windows/Linux asset names), so the fix is always the same command.
+    command -v nodtool >/dev/null 2>&1 || \
+        fail "--game requires nodtool on PATH; install it with: cargo install --locked nodtool"
+fi
 xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 || \
     fail "no iOS SDK found (xcrun --sdk iphoneos --show-sdk-path failed) - install Xcode, not just the Command Line Tools"
 
@@ -277,7 +284,6 @@ if [[ -n "$game_dump" ]]; then
         log_step skip-extract-game "Assets/ already has an extracted game dump; skipping --game"
     else
         assert_file "$game_dump" "Game dump"
-        require_command nodtool nodtool
 
         pinned_game_id=$(awk '
             /^project:/ { in_project = 1; next }
