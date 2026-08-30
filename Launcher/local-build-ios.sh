@@ -362,10 +362,13 @@ if (( builds_retro )); then
     if [[ -n "$retro_rewind_zip" ]]; then
         assert_file "$retro_rewind_zip" "Retro Rewind zip"
         retro_extract_dir=$build/retro-rewind-extract
-        log_step extract-retro-rewind "Extracting the Retro Rewind distribution"
-        rm -rf "$retro_extract_dir"
-        mkdir -p "$retro_extract_dir"
-        unzip -q "$retro_rewind_zip" -d "$retro_extract_dir"
+        if [[ -d "$retro_extract_dir" ]]; then
+            log_step skip-extract-retro-rewind "$retro_extract_dir already exists; skipping Retro Rewind zip extraction"
+        else
+            log_step extract-retro-rewind "Extracting the Retro Rewind distribution"
+            mkdir -p "$retro_extract_dir"
+            unzip -q "$retro_rewind_zip" -d "$retro_extract_dir"
+        fi
         retro_root=$(resolve_retro_rewind_dir "$retro_extract_dir")
     else
         assert_dir "$retro_rewind_dir" "Retro Rewind folder"
