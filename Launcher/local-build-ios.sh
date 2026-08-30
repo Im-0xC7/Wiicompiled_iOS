@@ -160,7 +160,9 @@ Usage: local-build-ios.sh --output-dir DIR [options]
                                 downside since sideloading a much older device is uncommon)
   --bundle-id ID                 CFBundleIdentifier (default: dev.wiicompiled.game). A Retro
                                 Rewind build always gets ID.retro so both can install at once.
-  --bundle-name NAME             CFBundleName, the home-screen display name (default: WiiCompiled).
+  --bundle-name NAME             CFBundleName/CFBundleDisplayName, the home-screen icon label
+                                (default: WiiCompiled). A Retro Rewind build always shows
+                                "Retro Rewind" instead, so both are told apart once installed.
                                 The .app folder and binary itself are always named after the CMake
                                 target (WiiCompiled/RetroRewind), which this does not change.
   --bundle-version VERSION      CFBundleVersion, a build number (default: 1)
@@ -658,9 +660,14 @@ package_built_product() {
     assert_dir "$app_bundle" "Built .app bundle"
 
     # RetroRewind needs a distinct CFBundleIdentifier from the base build so both can be installed
-    # on the same device at once, the same way they are two separate products on Windows/Linux.
+    # on the same device at once, the same way they are two separate products on Windows/Linux -
+    # and a distinct SpringBoard name/icon label, so the two are told apart once both are installed.
     local this_bundle_id=$bundle_id
-    [[ "$provenance_profile" == "retro-rewind" ]] && this_bundle_id="$bundle_id.retro"
+    local this_bundle_name=$bundle_name
+    if [[ "$provenance_profile" == "retro-rewind" ]]; then
+        this_bundle_id="$bundle_id.retro"
+        this_bundle_name="Retro Rewind"
+    fi
 
     log_step "patch-info-plist-$target" "Writing $target's Info.plist"
     cat > "$app_bundle/Info.plist" <<PLIST
@@ -677,7 +684,9 @@ package_built_product() {
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$bundle_name</string>
+	<string>$this_bundle_name</string>
+	<key>CFBundleDisplayName</key>
+	<string>$this_bundle_name</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
