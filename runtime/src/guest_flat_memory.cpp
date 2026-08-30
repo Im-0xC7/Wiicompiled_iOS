@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,15 @@
 #endif
 
 namespace GuestFlat {
+
+// Declared here (GuestFlat-namespace scope, external linkage) rather than in the anonymous
+// namespace below like the rest of this module's internal state, because MKW_FLAT_GUEST_BASE
+// (guest_flat_memory.h) reads it directly from every other translation unit that touches guest
+// memory - every translated function among them. See EnsureReservation() and
+// kGuestReservationBase's comment for why this can no longer be a compile-time constant on
+// platforms where the OS, not this module, has to choose the reservation's address.
+uint8_t* g_base = nullptr;
+
 namespace {
 
 #if defined(_WIN32)
@@ -72,7 +82,6 @@ VirtualAlloc2Fn g_virtualAlloc2 = nullptr;
 MapViewOfFile3Fn g_mapViewOfFile3 = nullptr;
 #endif
 
-uint8_t* g_base = nullptr;
 bool g_initialized = false;
 std::vector<RegionRequest> g_activeRegions;
 #if defined(_WIN32)
@@ -219,67 +228,41 @@ void ResolvePlacementApi() {
 
 void EnsureReservation() {
     if (g_base != nullptr) return;
+    // Only the top half of the 4 GiB guest space (see kGuestReservationBase's comment) is ever
+    // actually reserved; g_base is set kGuestReservationBase bytes *below* the real reservation
+    // so every existing `g_base + addr` access site keeps working unchanged.
+    constexpr uint64_t kReservationSize = kGuestSpaceSize - kGuestReservationBase;
+    // No address hint anywhere here (see g_base's comment in guest_flat_memory.h for why a fixed
+    // hint cannot work on every platform this runtime targets): the OS places the reservation
+    // wherever it has room, which - unlike guessing an address - can never fail merely because a
+    // particular spot is unusable.
 #if defined(_WIN32)
     ResolvePlacementApi();
-
-    void* requested = reinterpret_cast<void*>(kFixedFlatGuestBase);
 
     // One extra granule stays an uncommitted placeholder so an access that
     // straddles 0xFFFFFFFF faults instead of corrupting whatever the allocator
     // happened to place directly after the reservation.
-    void* reserved = g_virtualAlloc2(GetCurrentProcess(), requested,
-                                     static_cast<SIZE_T>(kGuestSpaceSize + kAllocationGranularity),
+    void* reserved = g_virtualAlloc2(GetCurrentProcess(), nullptr,
+                                     static_cast<SIZE_T>(kReservationSize + kAllocationGranularity),
                                      MEM_RESERVE | kMemReservePlaceholder, PAGE_NOACCESS,
                                      nullptr, 0);
     if (reserved == nullptr) {
         std::ostringstream oss;
-        oss << "Unable to reserve the 4 GiB flat guest address space at 0x" << std::hex
-            << reinterpret_cast<uintptr_t>(requested) << std::dec
-            << " (GetLastError=" << GetLastError()
-            << "). The translated code addresses guest memory through this fixed base, so it "
-               "cannot fall back to another one. Something else in this process reserved the "
-               "16 TiB region first - an injected DLL, an overlay or a debugging tool is the "
-               "usual cause.";
+        oss << "Unable to reserve the flat guest address space (GetLastError=" << GetLastError()
+            << ").";
         throw std::runtime_error(oss.str());
     }
-    if (reserved != requested) {
-        throw std::runtime_error(
-            "The flat guest reservation did not land on the fixed base the translated code was "
-            "compiled against.");
-    }
 #else
-    void* requested = reinterpret_cast<void*>(kFixedFlatGuestBase);
-
-    // No MAP_FIXED here (and deliberately no MAP_FIXED_NOREPLACE, which needs Linux 4.17+ -
-    // this must work on kernels as old as 4.9): `requested` is only a hint. The kernel's
-    // get_unmapped_area honors a page-aligned hint when the whole range is free, so this lands
-    // on the fixed base in the normal case; if anything already occupies part of the range, the
-    // kernel silently picks a different address instead of clobbering it, which the check below
-    // catches - same "something got there first" contract as the Windows path, without needing
-    // a specific kernel version.
-    void* reserved = mmap(requested, kGuestSpaceSize + kAllocationGranularity, kProtNone,
+    void* reserved = mmap(nullptr, kReservationSize + kAllocationGranularity, kProtNone,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (reserved == MAP_FAILED) {
         std::ostringstream oss;
-        oss << "Unable to reserve the 4 GiB flat guest address space at 0x" << std::hex
-            << reinterpret_cast<uintptr_t>(requested) << std::dec
-            << " (" << std::strerror(errno)
-            << "). The translated code addresses guest memory through this fixed base, so it "
-               "cannot fall back to another one.";
-        throw std::runtime_error(oss.str());
-    }
-    if (reserved != requested) {
-        munmap(reserved, kGuestSpaceSize + kAllocationGranularity);
-        std::ostringstream oss;
-        oss << "Unable to reserve the 4 GiB flat guest address space at 0x" << std::hex
-            << reinterpret_cast<uintptr_t>(requested) << std::dec
-            << ". Something else in this process already occupies part of the 16 TiB region - "
-               "an injected library, an overlay or a debugging tool is the usual cause.";
+        oss << "Unable to reserve the flat guest address space (" << std::strerror(errno) << ").";
         throw std::runtime_error(oss.str());
     }
 #endif
 
-    g_base = static_cast<uint8_t*>(reserved);
+    g_base = static_cast<uint8_t*>(reserved) - kGuestReservationBase;
 }
 
 #if defined(_WIN32)
@@ -545,6 +528,51 @@ void Initialize(const std::vector<RegionRequest>& regions) {
         if (section.hostView == nullptr) {
             throw std::runtime_error(LastErrorText("MapViewOfFile for the host guest-RAM alias"));
         }
+#elif defined(__APPLE__)
+        // The section is an anonymous shared-memory object: the SAME physical pages get mapped
+        // twice below (once here as the always-accessible host view, once per-region as the
+        // guest view whose protection the fault handler controls), the same "one backing store,
+        // two VA aliases" trick CreateFileMapping/MapViewOfFile(3) gives Windows.
+        //
+        // memfd_create (used on Linux below) is a Linux-only syscall with no Darwin equivalent,
+        // and SHM_ANON (the BSD anonymous-shm_open extension) is FreeBSD-only - Darwin doesn't
+        // have it either. shm_open itself (the portable POSIX fallback, tried first here in an
+        // earlier version of this code) works fine on macOS but is flatly denied (EPERM) by the
+        // iOS App Sandbox on a real device - verified on-device, not just believed from docs;
+        // Simulator and native macOS builds never exercise that sandbox at all, which is why this
+        // wasn't caught earlier. A plain temp file inside the app's own writable container is the
+        // fallback that actually works everywhere Apple ships this runtime on: ordinary file I/O
+        // within the sandbox is always permitted, and unlinking it immediately after open removes
+        // its directory entry before anything else could observe or collide with it, leaving only
+        // the open fd - the same "no filesystem-visible identity" property shm_open/memfd_create
+        // both gave, just built out of an API the sandbox doesn't specifically block.
+        {
+            const char* tmpDir = std::getenv("TMPDIR");
+            if (tmpDir == nullptr || *tmpDir == '\0') {
+                tmpDir = "/tmp";
+            }
+            static std::atomic<uint32_t> nameCounter{0};
+            char path[PATH_MAX];
+            std::snprintf(path, sizeof(path), "%s/wiicompiled-guest-ram-%d-%u", tmpDir,
+                          static_cast<int>(getpid()),
+                          nameCounter.fetch_add(1, std::memory_order_relaxed));
+            section.fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (section.fd >= 0) {
+                unlink(path);
+            }
+        }
+        if (section.fd < 0) {
+            throw std::runtime_error(LastErrorText("open (tmpfile) for guest RAM"));
+        }
+        if (ftruncate(section.fd, static_cast<off_t>(rounded)) != 0) {
+            throw std::runtime_error(LastErrorText("ftruncate for guest RAM"));
+        }
+        section.hostView = static_cast<uint8_t*>(
+            mmap(nullptr, static_cast<size_t>(rounded), kProtReadWrite, MAP_SHARED, section.fd, 0));
+        if (section.hostView == MAP_FAILED) {
+            section.hostView = nullptr;
+            throw std::runtime_error(LastErrorText("mmap for the host guest-RAM alias"));
+        }
 #else
         // The section is an anonymous shared-memory object: the SAME physical pages get mapped
         // twice below (once here as the always-accessible host view, once per-region as the
@@ -690,7 +718,10 @@ bool HandleAccessViolation(void* faultAddress, bool isWrite) noexcept {
 
     const uintptr_t fault = reinterpret_cast<uintptr_t>(faultAddress);
     const uintptr_t base = reinterpret_cast<uintptr_t>(g_base);
-    if (fault < base || fault - base >= kGuestSpaceSize) return false;
+    // The lower kGuestReservationBase bytes of this "space" were never actually reserved (see
+    // its comment in guest_flat_memory.h) - a fault there cannot be a guest memory access this
+    // module is responsible for, so it must not be swallowed here.
+    if (fault < base + kGuestReservationBase || fault - base >= kGuestSpaceSize) return false;
 
     const uint32_t guestAddress = static_cast<uint32_t>(fault - base);
 

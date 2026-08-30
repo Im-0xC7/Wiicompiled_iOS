@@ -38,8 +38,36 @@
 #include <dbghelp.h>
 #else
 #include <signal.h>
+#if defined(__APPLE__)
+// macOS's <ucontext.h> refuses to declare the ucontext_t/mcontext_t types (read-only here, for
+// the crash handler's fault-address reporting - nothing in this file calls the actual
+// get/make/swapcontext functions the guard is really gatekeeping) unless _XOPEN_SOURCE opts into
+// the deprecated POSIX ucontext API. Scoped to just this include and then undone immediately so
+// it doesn't change what any other unity-combined source file in this translation unit sees from
+// the system headers it includes later.
+#define _XOPEN_SOURCE 600
 #include <ucontext.h>
+#undef _XOPEN_SOURCE
+#else
+#include <ucontext.h>
+#endif
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+// iOS has no free-standing process entry point the way desktop platforms do - UIApplicationMain()
+// has to run first and drive the real app lifecycle before any window/GPU surface can exist.
+// SDL3 supplies that: SDL_main.h's macro renames this file's main() to SDL_main and SDL provides
+// the real main() (calling UIApplicationMain(), which eventually invokes the renamed one from
+// inside a properly running UIKit app). Without this include, main() stays the literal process
+// entry point, no UIApplication ever starts, and SDL_Init() below fails with "Application didn't
+// initialize properly, did you include SDL_main.h...". runtime/cmake/PublicProducts.cmake leaves
+// SDL_MAIN_HANDLED undefined for iOS specifically so this rename isn't suppressed there, unlike
+// every other platform this runtime targets.
+#include <SDL3/SDL_main.h>
+#endif
 #endif
 
 #include "abi_bridge.h"

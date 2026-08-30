@@ -26,6 +26,9 @@
 #else
 #include <cstdlib>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 struct RuntimeUserConfig {
@@ -172,6 +175,26 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
         }
         buffer.resize(buffer.size() * 2);
     }
+#elif defined(__APPLE__)
+    // Darwin (macOS and iOS, device and simulator alike) has no /proc at all, so the Linux
+    // branch's magic symlink doesn't apply here. _NSGetExecutablePath is the Darwin equivalent of
+    // GetModuleFileNameW/readlink("/proc/self/exe"): it fails with the required size the first
+    // time if the buffer is too small, so this grows the buffer exactly once from that answer
+    // rather than doubling blindly, the same "ask the OS how big a buffer to bring" pattern
+    // GetModuleFileNameW's loop converges toward.
+    uint32_t size = 256;
+    std::string buffer(size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        buffer.resize(size);
+        if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+            return std::nullopt;
+        }
+    }
+    const auto nulPosition = buffer.find('\0');
+    if (nulPosition != std::string::npos) {
+        buffer.resize(nulPosition);
+    }
+    return std::filesystem::path(buffer).parent_path();
 #else
     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
@@ -228,6 +251,20 @@ inline std::filesystem::path ApplicationDataDirectory() {
         const std::filesystem::path directory = std::filesystem::path(rawPath) / kApplicationDirectoryName;
         CoTaskMemFree(rawPath);
         return directory;
+    }
+#elif defined(__APPLE__)
+    // ~/Library/Application Support is Apple's own per-app data directory convention (what
+    // NSApplicationSupportDirectory/FileManager .applicationSupportDirectory resolve to) - the
+    // XDG-style $HOME/.local/share path below works fine on unsandboxed macOS but is flatly
+    // denied (EPERM) by the iOS App Sandbox: HOME points at the app's container, but only its
+    // designated subdirectories (Documents, Library, tmp) are actually writable - creating a new
+    // top-level ".local" entry directly in the container root is exactly the kind of write the
+    // sandbox exists to block. Verified on-device, not just believed from docs; this is used
+    // uniformly on every Apple platform rather than only iOS since it is the correct convention
+    // on macOS too, not merely a workaround.
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / "Library" / "Application Support" /
+               kApplicationDirectoryName;
     }
 #else
     // XDG Base Directory spec equivalent of FOLDERID_LocalAppData: $XDG_DATA_HOME if set and
@@ -835,7 +872,25 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
 // The extracted DATA directory. Empty when nothing is configured.
 inline std::filesystem::path ResolvedDvdRoot() {
     const std::string configured = DvdRoot();
-    return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
+    if (!configured.empty()) {
+        return ResolveRelativeToConfig(configured);
+    }
+#if defined(__APPLE__)
+    // On Apple platforms - and iOS specifically - there is no practical way for a user to hand-
+    // edit Config.toml inside an installed app's sandboxed container (no Finder/Files-app access
+    // to it without UIFileSharingEnabled, unlike Windows/Linux where the Launcher's install flow
+    // already writes dvd_root explicitly during setup). So when nothing is configured, fall back
+    // to a DATA/ directory bundled directly alongside the executable (i.e. inside the .app), the
+    // same "next to the binary" convention every other bundled asset in this runtime already
+    // uses (dsp_coef.bin, wii_bootstrap/, initial_pipeline_cache.db - see ax_mix.cpp/main.cpp).
+    // No validation here: an empty/missing candidate just falls through as before and
+    // GetDvdRoot() in dvd.cpp reports the same "not an extracted DATA directory" error it always
+    // has for a bad explicit value.
+    if (const auto executableDirectory = ExecutableDirectory()) {
+        return (*executableDirectory / "DATA").lexically_normal();
+    }
+#endif
+    return std::filesystem::path{};
 }
 
 /// The canonical Retro Rewind installation the frontend owns, or "" when none is recorded.
