@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -36,6 +37,7 @@ inline uint32_t PpcStorePsqFloatBitsInline(uint32_t value)
 }
 
 
+#if defined(__x86_64__) || defined(_M_X64)
 inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
 {
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
@@ -111,6 +113,59 @@ inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
         _mm_castps_si128(PpcPsToM128Inline(value)));
     _mm_storel_epi64(reinterpret_cast<__m128i*>(host), PpcPsqSwapPairBytesInline(lanes));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Scalar port. Applying PpcLoadPsqFloatBitsInline/PpcStorePsqFloatBitsInline (already portable,
+// defined above) independently to each 32-bit half is bit-exact with the SSE lane-vectorized
+// forms: on a little-endian host, bits[0:31] of the packed representation is ps1 and bits[32:63]
+// is ps0 (see PPC_FPR in ppc_isa_context.h), which is exactly what the "hi"/"lo" split below
+// operates on.
+inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
+{
+    const uint32_t hi = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    const uint32_t lo = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
+{
+    const uint32_t hi = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    const uint32_t lo = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+// host -> packed FPR double, guard already proven by the caller. Guest (PowerPC) memory holds
+// ps0 as 4 big-endian bytes followed by ps1 as 4 big-endian bytes; byte-swapping each half
+// independently and quieting/flushing it, then packing via PpcPackPairedBitsInline (ps0 in the
+// high 32 bits, ps1 in the low 32, matching PPC_FPR), reproduces the SSE path's full-8-byte
+// reversal bit for bit without needing any lane-shuffle reasoning.
+inline double PpcLoadPairPsqFloatFromHostInline(const uint8_t* host)
+{
+    uint32_t ps0Bits = 0;
+    uint32_t ps1Bits = 0;
+    std::memcpy(&ps0Bits, host, sizeof(ps0Bits));
+    std::memcpy(&ps1Bits, host + sizeof(ps0Bits), sizeof(ps1Bits));
+    ps0Bits = __builtin_bswap32(ps0Bits);
+    ps1Bits = __builtin_bswap32(ps1Bits);
+    ps0Bits = PpcLoadPsqFloatBitsInline(ps0Bits);
+    ps1Bits = PpcLoadPsqFloatBitsInline(ps1Bits);
+    return PpcPackPairedBitsInline(ps0Bits, ps1Bits);
+}
+
+// packed FPR double -> host, guard already proven by the caller. Mirror of the load above.
+inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
+{
+    PPC_FPR fpr{};
+    fpr.d = value;
+    uint32_t ps0Bits = PpcBitCastToU32Inline(fpr.paired.ps0);
+    uint32_t ps1Bits = PpcBitCastToU32Inline(fpr.paired.ps1);
+    ps0Bits = PpcStorePsqFloatBitsInline(ps0Bits);
+    ps1Bits = PpcStorePsqFloatBitsInline(ps1Bits);
+    ps0Bits = __builtin_bswap32(ps0Bits);
+    ps1Bits = __builtin_bswap32(ps1Bits);
+    std::memcpy(host, &ps0Bits, sizeof(ps0Bits));
+    std::memcpy(host + sizeof(ps0Bits), &ps1Bits, sizeof(ps1Bits));
+}
+#endif
 
 template <typename SignedType>
 inline SignedType PpcScaleAndClampPsqInline(float value, uint32_t scale)
@@ -323,9 +378,10 @@ inline uint8_t PpcQuantizePsqU8Scale61Inline(float value)
     return static_cast<uint8_t>(scaled);
 }
 
-// GQR U8 scale 61 is common in paired stores. Quantize both payload lanes as
-// one native vector so the normal finite path does not branch once per lane.
-// MAXPS with zero as the second operand also maps either NaN lane to zero,
+// GQR U8 scale 61 is common in paired stores.
+#if defined(__x86_64__) || defined(_M_X64)
+// Quantize both payload lanes as one native vector so the normal finite path does not branch
+// once per lane. MAXPS with zero as the second operand also maps either NaN lane to zero,
 // matching PpcQuantizePsqU8Scale61Inline's !(scaled > 0) rule.
 inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
 {
@@ -339,6 +395,19 @@ inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
     // therefore produces the guest-order numeric value (ps0 << 8) | ps1.
     return static_cast<uint16_t>(_mm_cvtsi128_si32(lanes8));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Scalar port: apply the already-portable per-lane PpcQuantizePsqU8Scale61Inline to ps0/ps1
+// independently and pack as (ps0 << 8) | ps1, matching the guest-order numeric value the SSE
+// path produces (see its comment above).
+inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
+{
+    PPC_FPR fpr{};
+    fpr.d = value;
+    const uint8_t ps0 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps0);
+    const uint8_t ps1 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps1);
+    return static_cast<uint16_t>((static_cast<uint16_t>(ps0) << 8) | ps1);
+}
+#endif
 
 // Preserve the complete memory/MMIO/executable-write behavior off the leaf
 // path. Keeping this out of line prevents those uncommon checks from being

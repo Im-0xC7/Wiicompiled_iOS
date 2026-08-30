@@ -78,6 +78,7 @@ inline void PpcSetPairedFprInline(PPC_FPR& fpr, double packed)
     fpr.d = packed;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 // Must stay inside the XMM register domain. Bitcasting through a 64-bit GPR added a movq
 // domain crossing on every paired-single op (630 in the THP IDCT region alone); a double
 // local already lives in an XMM register, so these casts compile to nothing.
@@ -134,6 +135,35 @@ inline double PpcPackPairedInline(float ps0, float ps1)
     // ps1 and lane 1 becomes ps0, matching the union layout bit for bit.
     return PpcM128ToPsInline(_mm_unpacklo_ps(_mm_set_ss(ps1), _mm_set_ss(ps0)));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Scalar (non-SIMD) port: correctness-first bring-up for arm64. Unlike the SSE path above,
+// this doesn't need a vector-register detour at all - PPC_FPR (ppc_isa_context.h) already
+// gives the exact ps0/ps1 bit layout, so lane access is a plain union read/write instead of a
+// register-domain shuffle. A NEON-vectorized fast path (float32x2_t, matching this register's
+// natural 2-lane width) is a valid future perf follow-up, mirroring the AVX2/scalar split
+// ax_mix_kernels.h already uses, but is not needed for a first correct arm64 build.
+inline float PpcGetPs0Inline(double value)
+{
+    PPC_FPR fpr{};
+    fpr.d = value;
+    return fpr.paired.ps0;
+}
+
+inline float PpcGetPs1Inline(double value)
+{
+    PPC_FPR fpr{};
+    fpr.d = value;
+    return fpr.paired.ps1;
+}
+
+inline double PpcPackPairedInline(float ps0, float ps1)
+{
+    PPC_FPR fpr{};
+    fpr.paired.ps0 = ps0;
+    fpr.paired.ps1 = ps1;
+    return fpr.d;
+}
+#endif
 
 // FPSCR[NI] is modeled by MXCSR FTZ/DAZ, so arithmetic output flushing compiles to nothing.
 // Two cases still need a software check against the mirrored bit (not STMXCSR, too hot):
@@ -143,6 +173,7 @@ inline bool MkwHostNiActiveInline() noexcept
     return g_mkwHostNiActive;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 inline float PpcForceSingleValueInline(double value)
 {
     // FPSCR[NI] flushes an exact pre-round single-subnormal even when rounding would promote it
@@ -157,6 +188,20 @@ inline float PpcForceSingleValueInline(double value)
     const __m128d kept = _mm_andnot_pd(_mm_andnot_pd(signMask, flush), v);
     return static_cast<float>(_mm_cvtsd_f64(kept));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+inline float PpcForceSingleValueInline(double value)
+{
+    // Same rule as the SSE path above, expressed as a plain branch instead of a branchless mask:
+    // FPSCR[NI] flushes an exact pre-round single-subnormal even when rounding would promote it
+    // to the smallest normal. g_mkwNiFlushThreshold is 2^-126 while NI is active and 0.0
+    // otherwise, so `magnitude < threshold` is always false when NI is inactive - matching the
+    // SSE version's "|value| < 0.0 is always false" identity.
+    const double magnitude = std::abs(value);
+    if (magnitude < g_mkwNiFlushThreshold)
+        return static_cast<float>(std::copysign(0.0, value));
+    return static_cast<float>(value);
+}
+#endif
 
 inline float PpcFlushSingleForNiInline(float value)
 {
@@ -468,6 +513,7 @@ inline double PpcFnmsubsInline(double a, double c, double b)
     return static_cast<double>(std::isnan(result) ? result : -result);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 inline double PPC_PsMulInline(double lhs, double rhs)
 {
     return PpcFlushPairedForNiInline(
@@ -547,6 +593,105 @@ inline double PPC_PsMuls1Inline(double aValue, double cValue)
     return PpcFlushPairedForNiInline(PpcM128ToPsInline(
         _mm_mul_ps(PpcPsToM128Inline(aValue), PpcBroadcastPs1Inline(cValue))));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Scalar port of the block above - see the PpcGetPs0Inline comment for why no vector register
+// detour (NEON or otherwise) is needed for correctness here. std::fma(float,float,float) rounds
+// once at float precision per the standard, matching _mm_fmadd_ps's per-lane FMA exactly; the
+// negate-unless-NaN nmadd/nmsub rule is a direct per-lane std::isnan check instead of
+// PpcNegateNonNanLanesInline's sign-xor/blend trick. NI flushing is handled by FPCR.FZ (see
+// MkwApplyHostNiMode in ppc_isa_fpenv.h), so the NI and NoNi entry points are identical here,
+// same as the SSE path.
+inline double PPC_PsMulInline(double lhs, double rhs)
+{
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(lhs) * PpcGetPs0Inline(rhs),
+        PpcGetPs1Inline(lhs) * PpcGetPs1Inline(rhs)));
+}
+
+inline double PPC_PsMulNoNiInline(double lhs, double rhs)
+{
+    return PpcPackPairedInline(
+        PpcGetPs0Inline(lhs) * PpcGetPs0Inline(rhs),
+        PpcGetPs1Inline(lhs) * PpcGetPs1Inline(rhs));
+}
+
+inline double PPC_PsMsubInline(double multiplicand, double multiplier, double subtractor)
+{
+    return PpcPackPairedInline(
+        std::fma(PpcGetPs0Inline(multiplicand), PpcGetPs0Inline(multiplier), -PpcGetPs0Inline(subtractor)),
+        std::fma(PpcGetPs1Inline(multiplicand), PpcGetPs1Inline(multiplier), -PpcGetPs1Inline(subtractor)));
+}
+
+inline double PPC_PsMsubNoNiInline(double multiplicand, double multiplier, double subtractor)
+{
+    return PPC_PsMsubInline(multiplicand, multiplier, subtractor);
+}
+
+inline double PPC_PsMaddInline(double multiplicand, double multiplier, double addend)
+{
+    return PpcPackPairedInline(
+        std::fma(PpcGetPs0Inline(multiplicand), PpcGetPs0Inline(multiplier), PpcGetPs0Inline(addend)),
+        std::fma(PpcGetPs1Inline(multiplicand), PpcGetPs1Inline(multiplier), PpcGetPs1Inline(addend)));
+}
+
+inline double PPC_PsMaddNoNiInline(double multiplicand, double multiplier, double addend)
+{
+    return PPC_PsMaddInline(multiplicand, multiplier, addend);
+}
+
+inline double PPC_PsMadds0Inline(double multiplicand, double multiplier, double addend)
+{
+    const float mul0 = PpcGetPs0Inline(multiplier);
+    return PpcPackPairedInline(
+        std::fma(PpcGetPs0Inline(multiplicand), mul0, PpcGetPs0Inline(addend)),
+        std::fma(PpcGetPs1Inline(multiplicand), mul0, PpcGetPs1Inline(addend)));
+}
+
+inline double PPC_PsMadds1Inline(double multiplicand, double multiplier, double addend)
+{
+    const float mul1 = PpcGetPs1Inline(multiplier);
+    return PpcPackPairedInline(
+        std::fma(PpcGetPs0Inline(multiplicand), mul1, PpcGetPs0Inline(addend)),
+        std::fma(PpcGetPs1Inline(multiplicand), mul1, PpcGetPs1Inline(addend)));
+}
+
+inline double PPC_PsNmsubInline(double multiplicand, double multiplier, double subtractor)
+{
+    const float ps0 = std::fma(
+        PpcGetPs0Inline(multiplicand), PpcGetPs0Inline(multiplier), -PpcGetPs0Inline(subtractor));
+    const float ps1 = std::fma(
+        PpcGetPs1Inline(multiplicand), PpcGetPs1Inline(multiplier), -PpcGetPs1Inline(subtractor));
+    return PpcPackPairedInline(std::isnan(ps0) ? ps0 : -ps0, std::isnan(ps1) ? ps1 : -ps1);
+}
+
+inline double PPC_PsNmsubNoNiInline(double multiplicand, double multiplier, double subtractor)
+{
+    return PPC_PsNmsubInline(multiplicand, multiplier, subtractor);
+}
+
+inline double PPC_PsNmaddInline(double multiplicand, double multiplier, double addend)
+{
+    const float ps0 = std::fma(
+        PpcGetPs0Inline(multiplicand), PpcGetPs0Inline(multiplier), PpcGetPs0Inline(addend));
+    const float ps1 = std::fma(
+        PpcGetPs1Inline(multiplicand), PpcGetPs1Inline(multiplier), PpcGetPs1Inline(addend));
+    return PpcPackPairedInline(std::isnan(ps0) ? ps0 : -ps0, std::isnan(ps1) ? ps1 : -ps1);
+}
+
+inline double PPC_PsMuls0Inline(double aValue, double cValue)
+{
+    const float c0 = PpcGetPs0Inline(cValue);
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) * c0, PpcGetPs1Inline(aValue) * c0));
+}
+
+inline double PPC_PsMuls1Inline(double aValue, double cValue)
+{
+    const float c1 = PpcGetPs1Inline(cValue);
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) * c1, PpcGetPs1Inline(aValue) * c1));
+}
+#endif
 
 inline PPC_FPR PpcMakePairedResultInline(float ps0, float ps1);
 
@@ -574,6 +719,7 @@ inline double PPC_PsToScalarInline(double value)
 // ps_merge* are pure lane selections (result.ps0 from frA, result.ps1 from frB); with lane 0
 // == ps1 and lane 1 == ps0, two shuffles build the result bit-exact instead of round-tripping
 // through the pack helper.
+#if defined(__x86_64__) || defined(_M_X64)
 inline double PPC_PsMerge00Inline(double aValue, double bValue)
 {
     // lane0 = b.ps0 (b lane 1), lane1 = a.ps0 (a lane 1)
@@ -616,6 +762,44 @@ inline double PPC_PsAddNoNiInline(double aValue, double bValue)
     return PpcM128ToPsInline(
         _mm_add_ps(PpcPsToM128Inline(aValue), PpcPsToM128Inline(bValue)));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Scalar equivalents. result.ps0 is drawn from frA, result.ps1 from frB per the PowerPC
+// ps_merge* definition (see comment above) - the union-based Get/Pack helpers make this a
+// direct lane pick with no shuffle needed to reproduce it bit-exact.
+inline double PPC_PsMerge00Inline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(PpcGetPs0Inline(aValue), PpcGetPs0Inline(bValue));
+}
+
+inline double PPC_PsMerge01Inline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(PpcGetPs0Inline(aValue), PpcGetPs1Inline(bValue));
+}
+
+inline double PPC_PsMerge10Inline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(PpcGetPs1Inline(aValue), PpcGetPs0Inline(bValue));
+}
+
+inline double PPC_PsMerge11Inline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(PpcGetPs1Inline(aValue), PpcGetPs1Inline(bValue));
+}
+
+inline double PPC_PsAddInline(double aValue, double bValue)
+{
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) + PpcGetPs0Inline(bValue),
+        PpcGetPs1Inline(aValue) + PpcGetPs1Inline(bValue)));
+}
+
+inline double PPC_PsAddNoNiInline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) + PpcGetPs0Inline(bValue),
+        PpcGetPs1Inline(aValue) + PpcGetPs1Inline(bValue));
+}
+#endif
 
 inline double PPC_PsSelInline(double lhsValue, double controlValue, double rhsValue)
 {
@@ -630,6 +814,7 @@ inline double PPC_PsSelInline(double lhsValue, double controlValue, double rhsVa
         control1 >= -0.0f ? lhs1 : rhs1);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 inline double PPC_PsSubInline(double aValue, double bValue)
 {
     return PpcFlushPairedForNiInline(
@@ -647,6 +832,28 @@ inline double PPC_PsDivInline(double aValue, double bValue)
     return PpcFlushPairedForNiInline(
         PpcM128ToPsInline(_mm_div_ps(PpcPsToM128Inline(aValue), PpcPsToM128Inline(bValue))));
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+inline double PPC_PsSubInline(double aValue, double bValue)
+{
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) - PpcGetPs0Inline(bValue),
+        PpcGetPs1Inline(aValue) - PpcGetPs1Inline(bValue)));
+}
+
+inline double PPC_PsSubNoNiInline(double aValue, double bValue)
+{
+    return PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) - PpcGetPs0Inline(bValue),
+        PpcGetPs1Inline(aValue) - PpcGetPs1Inline(bValue));
+}
+
+inline double PPC_PsDivInline(double aValue, double bValue)
+{
+    return PpcFlushPairedForNiInline(PpcPackPairedInline(
+        PpcGetPs0Inline(aValue) / PpcGetPs0Inline(bValue),
+        PpcGetPs1Inline(aValue) / PpcGetPs1Inline(bValue)));
+}
+#endif
 
 inline double PPC_PsNegInline(double value)
 {
