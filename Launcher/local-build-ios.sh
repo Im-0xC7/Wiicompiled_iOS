@@ -12,10 +12,13 @@
 # else. It has no Windows/Linux counterpart to stay in sync with beyond local-build.sh's general
 # shape, since neither of those platforms builds for iOS.
 #
-# Scope: base game only for now, no --profile/retro-rewind support - the underlying translator
-# commands are platform-agnostic (see local-build.sh's --profile handling for the pattern), but
-# Retro Rewind has not been built or tested on iOS at all, so this script does not claim to
-# support it yet rather than ship untested mod-profile code paths.
+# Supports the same --profile {base|retro-rewind|both} local-build.sh does. Unlike Linux (and
+# unlike WiiCompiled generally - see WiiCompiled.Setup.Common/RetroRewindSource.cs: "Wheel Wizard
+# owns [Retro Rewind] and passes it... each installer only resolves, reads, and records it, never
+# packages or copies it"), this script *does* accept the Retro Rewind distribution as a zip
+# (--retro-rewind-zip, as downloaded from rwfc.net) in addition to an already-extracted folder
+# (--retro-rewind-dir/local-build.sh's --retro-rewind-package-dir), since there is no Wheel-Wizard
+# equivalent driving this script.
 #
 # Produces an UNSIGNED .ipa. Every iOS install path (a paid Apple Developer account, a free-tier
 # sideloading tool such as AltStore/Sideloadly/Impactor, TrollStore, etc.) needs the user's own
@@ -57,6 +60,36 @@ sha256_of() {
     shasum -a 256 "$1" | awk '{print $1}'
 }
 
+resolve_retro_rewind_dir() {
+    # Bash port of WiiCompiled.Setup.Common/RetroRewindSource.cs's ResolveRetroRewind6: accepts
+    # the RetroRewind6 folder itself, a parent directory containing it directly, or (the shape
+    # rwfc.net's own zip unpacks to) a parent containing exactly one child whose own RetroRewind6
+    # subfolder has Binaries/Code.pul. `pwd -P` resolves symlinks to their physical path, the bash
+    # equivalent of that C# code's explicit DirectoryInfo.ResolveLinkTarget step.
+    local root=$1
+    local -a candidates=()
+    [[ -f "$root/Binaries/Code.pul" ]] && candidates+=("$root")
+    [[ -f "$root/RetroRewind6/Binaries/Code.pul" ]] && candidates+=("$root/RetroRewind6")
+    local child
+    for child in "$root"/*/; do
+        [[ -f "${child}RetroRewind6/Binaries/Code.pul" ]] && candidates+=("${child}RetroRewind6")
+    done
+    local -a resolved=()
+    local c
+    for c in "${candidates[@]}"; do
+        resolved+=("$(cd "$c" && pwd -P)")
+    done
+    local unique
+    unique=$(printf '%s\n' "${resolved[@]}" | sort -u)
+    local count=0
+    [[ -n "$unique" ]] && count=$(printf '%s\n' "$unique" | grep -c .)
+    case "$count" in
+        1) printf '%s\n' "$unique" ;;
+        0) fail "$root does not contain RetroRewind6/Binaries/Code.pul (looked in the folder itself, a RetroRewind6 subfolder, and any single child's RetroRewind6 subfolder). Pass the exact folder, or the rwfc.net zip, via --retro-rewind-dir/--retro-rewind-zip." ;;
+        *) fail "$root contains more than one RetroRewind6/Binaries/Code.pul; pass the exact folder via --retro-rewind-dir" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -64,7 +97,13 @@ sha256_of() {
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace=$(cd "$script_dir/.." && pwd)
 output_dir=""
+base_output_dir=""
 platform=device
+profile=base
+retro_rewind_zip=""
+retro_rewind_dir=""
+retro_wfc_offline_dir=""
+skip_retro_wfc_payload=0
 deployment_target=16.0
 bundle_id="dev.wiicompiled.game"
 bundle_name="WiiCompiled"
@@ -85,14 +124,28 @@ Usage: local-build-ios.sh --output-dir DIR [options]
 
   --workspace DIR              Repository root (default: this script's parent directory)
   --output-dir DIR             Where the built .ipa is published (required)
+  --base-output-dir DIR        Second output directory; required with --profile both
   --platform {device|simulator}  Build target (default: device). Device uses a prebuilt Dawn
                                 package (fast); simulator builds Dawn from source (slow, but lets
                                 you iterate without a physical device or a signing step at all).
+  --profile {base|retro-rewind|both}   Build profile (default: base)
+  --retro-rewind-zip PATH      The Retro Rewind distribution as downloaded from rwfc.net (a zip
+                                containing RetroRewind6, possibly under one wrapper folder)
+  --retro-rewind-dir PATH      An already-extracted RetroRewind6 folder, or a parent containing it
+                                (exactly one of --retro-rewind-zip/--retro-rewind-dir is required
+                                for a Retro Rewind build)
+  --retro-wfc-offline-dir DIR  Offline Retro-WFC payload directory
+  --skip-retro-wfc-payload     Build Retro Rewind without a Retro-WFC payload
+                                (exactly one of the two Retro-WFC options above is required for a
+                                Retro Rewind build)
   --deployment-target VERSION  Minimum iOS version (default: 16.0 - Dawn's std::atomic::wait
                                 usage needs iOS Simulator 14.0+; 16.0 leaves headroom with no real
                                 downside since sideloading a much older device is uncommon)
-  --bundle-id ID                CFBundleIdentifier (default: dev.wiicompiled.game)
-  --bundle-name NAME            CFBundleName / CFBundleExecutable display name (default: WiiCompiled)
+  --bundle-id ID                 CFBundleIdentifier (default: dev.wiicompiled.game). A Retro
+                                Rewind build always gets ID.retro so both can install at once.
+  --bundle-name NAME             CFBundleName, the home-screen display name (default: WiiCompiled).
+                                The .app folder and binary itself are always named after the CMake
+                                target (WiiCompiled/RetroRewind), which this does not change.
   --bundle-version VERSION      CFBundleVersion, a build number (default: 1)
   --bundle-short-version VER    CFBundleShortVersionString, a user-facing version (default: 1.0)
   --ios-toolchain PATH          ios-cmake's ios.toolchain.cmake (default: WORKSPACE/ios.toolchain.cmake
@@ -110,7 +163,13 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --workspace) workspace=$(cd "$2" && pwd); shift 2 ;;
         --output-dir) output_dir=$2; shift 2 ;;
+        --base-output-dir) base_output_dir=$2; shift 2 ;;
         --platform) platform=$2; shift 2 ;;
+        --profile) profile=$2; shift 2 ;;
+        --retro-rewind-zip) retro_rewind_zip=$2; shift 2 ;;
+        --retro-rewind-dir) retro_rewind_dir=$2; shift 2 ;;
+        --retro-wfc-offline-dir) retro_wfc_offline_dir=$2; shift 2 ;;
+        --skip-retro-wfc-payload) skip_retro_wfc_payload=1; shift ;;
         --deployment-target) deployment_target=$2; shift 2 ;;
         --bundle-id) bundle_id=$2; shift 2 ;;
         --bundle-name) bundle_name=$2; shift 2 ;;
@@ -134,7 +193,40 @@ case "$platform" in
     device|simulator) ;;
     *) fail "--platform must be device or simulator" ;;
 esac
+case "$profile" in
+    base|retro-rewind|both) ;;
+    *) fail "--profile must be base, retro-rewind, or both" ;;
+esac
 [[ "$(uname -s)" == "Darwin" ]] || fail "this script drives Xcode's iOS SDK and must run on macOS"
+
+builds_retro=0
+[[ "$profile" == "retro-rewind" || "$profile" == "both" ]] && builds_retro=1
+has_retro_source=0
+[[ -n "$retro_rewind_zip" || -n "$retro_rewind_dir" ]] && has_retro_source=1
+has_offline_retro_wfc=0
+[[ -n "$retro_wfc_offline_dir" ]] && has_offline_retro_wfc=1
+
+if [[ "$builds_retro" -eq 0 ]]; then
+    if [[ "$has_retro_source" -eq 1 || "$has_offline_retro_wfc" -eq 1 || "$skip_retro_wfc_payload" -eq 1 ]]; then
+        fail "Retro Rewind options are valid only for a Retro Rewind build (--profile retro-rewind or both)."
+    fi
+else
+    if [[ -n "$retro_rewind_zip" && -n "$retro_rewind_dir" ]]; then
+        fail "Choose exactly one Retro Rewind source: --retro-rewind-zip or --retro-rewind-dir."
+    fi
+    if [[ "$has_retro_source" -eq 0 ]]; then
+        fail "--retro-rewind-zip or --retro-rewind-dir is required for a Retro Rewind build."
+    fi
+    if [[ "$has_offline_retro_wfc" -eq "$skip_retro_wfc_payload" ]]; then
+        fail "Choose exactly one Retro-WFC mode: --retro-wfc-offline-dir or --skip-retro-wfc-payload."
+    fi
+fi
+if [[ "$profile" == "both" && -z "$base_output_dir" ]]; then
+    fail "--base-output-dir is required with --profile both; --output-dir receives the Retro Rewind product."
+fi
+if [[ "$profile" != "both" && -n "$base_output_dir" ]]; then
+    fail "--base-output-dir is valid only with --profile both."
+fi
 
 # ---------------------------------------------------------------------------
 # Tool resolution and prerequisite checks
@@ -151,6 +243,7 @@ require_command "$cmake_bin" cmake
 require_command "$ninja_bin" ninja
 require_command xcodebuild xcode
 require_command zip zip
+[[ -n "$retro_rewind_zip" ]] && require_command unzip unzip
 xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 || \
     fail "no iOS SDK found (xcrun --sdk iphoneos --show-sdk-path failed) - install Xcode, not just the Command Line Tools"
 
@@ -180,6 +273,23 @@ entry_point=$(awk '
     }
 ' "$project")
 [[ -n "$entry_point" ]] || fail "Could not find a translation entry point in $project"
+
+retro_root=""
+if (( builds_retro )); then
+    if [[ -n "$retro_rewind_zip" ]]; then
+        assert_file "$retro_rewind_zip" "Retro Rewind zip"
+        retro_extract_dir=$build/retro-rewind-extract
+        log_step extract-retro-rewind "Extracting the Retro Rewind distribution"
+        rm -rf "$retro_extract_dir"
+        mkdir -p "$retro_extract_dir"
+        unzip -q "$retro_rewind_zip" -d "$retro_extract_dir"
+        retro_root=$(resolve_retro_rewind_dir "$retro_extract_dir")
+    else
+        assert_dir "$retro_rewind_dir" "Retro Rewind folder"
+        retro_root=$(resolve_retro_rewind_dir "$(cd "$retro_rewind_dir" && pwd -P)")
+    fi
+    log_step resolve-retro-rewind "Using Retro Rewind at $retro_root"
+fi
 
 # ios-cmake (BSD-licensed, https://github.com/leetal/ios-cmake) is deliberately not vendored into
 # this repo, the same way CMake or Ninja themselves aren't - if the workspace doesn't already have
@@ -259,6 +369,36 @@ if [[ -f "$translation_provenance" ]]; then
     fi
 fi
 
+if (( builds_retro )); then
+    # The translator discovers the mod through the project file's workspace-relative profile
+    # paths, and both the base and mod leg block leaf inlining at every address the profile
+    # patches - so the selected Code.pul must sit at the profile's mod_root before either leg
+    # runs, same as local-build.sh.
+    source_pul=$retro_root/Binaries/Code.pul
+    assert_file "$source_pul" "Retro Rewind Code.pul"
+    staged_binaries=$workspace/PulsarPacks/completed/RetroRewind/RetroRewind6/Binaries
+    mkdir -p "$staged_binaries"
+    staged_pul=$staged_binaries/Code.pul
+    if [[ "$(cd "$(dirname "$source_pul")" && pwd)/$(basename "$source_pul")" != "$(cd "$(dirname "$staged_pul")" && pwd)/$(basename "$staged_pul")" ]]; then
+        cp -f "$source_pul" "$staged_pul"
+    fi
+fi
+
+if (( reuse_base )) && (( builds_retro )); then
+    # A base tree that never saw this Code.pul would silently bake vanilla code into the modded
+    # product - check-base-mod-awareness fails closed (anything but exit 0 forces a retranslation).
+    retro_code_pul=$retro_root/Binaries/Code.pul
+    assert_file "$retro_code_pul" "Retro Rewind Code.pul"
+    pul_sha=$(sha256_of "$retro_code_pul")
+    if ! grep -q "\"codePulSha256\":\"$pul_sha\"" "$base_metadata"; then
+        if ! translator check-base-mod-awareness --project "$project" --profile retro-rewind \
+            --translation-output-metadata "$base_metadata" --code-pul "$retro_code_pul"; then
+            log_step retranslate-base "The base translation is stale; retranslating the base game for the new Code.pul"
+            reuse_base=0
+        fi
+    fi
+fi
+
 if (( reuse_base )); then
     log_step reuse-base-translation "Reusing the completed base translation"
 else
@@ -279,12 +419,38 @@ else
         > "$translation_provenance"
 fi
 
+if (( builds_retro )); then
+    code_pul=$retro_root/Binaries/Code.pul
+    assert_file "$code_pul" "Retro Rewind Code.pul"
+    retro_out=$workspace/build/mods/retro_rewind_full_cpp
+    translate_mod_args=(translate-mod --project "$project" --profile retro-rewind
+        --base-manifest "$base_manifest" --base-translation-output-metadata "$base_metadata"
+        --code-pul "$code_pul" --mod-root "$retro_root" --mod-name "Retro Rewind"
+        --region P --out "$retro_out" --prefer-cached-inputs --emit-cpp
+        --threads "$translator_threads")
+    if (( skip_retro_wfc_payload )); then
+        translate_mod_args+=(--skip-retro-wfc)
+    else
+        offline_payload=$retro_wfc_offline_dir/binary/payload.RMCPD00.bin
+        assert_file "$offline_payload" "Offline Retro-WFC shared payload"
+        translate_mod_args+=(--retro-wfc-payload "$offline_payload")
+    fi
+    log_step translate-mod "Translating the selected Retro Rewind Code.pul"
+    translator "${translate_mod_args[@]}"
+fi
+
 log_step generate-data-init "Generating local game data initialization"
 translator generate-data-init --project "$project"
 
+shard_args=(emit-build-shards --project "$project" --base-metadata "$base_metadata"
+    --base-functions-dir "$functions" --native-source-dir "$workspace/runtime/src" --out "$shards")
+if (( builds_retro )); then
+    retro_out=$workspace/build/mods/retro_rewind_full_cpp
+    shard_args+=(--resolved-profile "$retro_out/resolved_dispatch_profile.json"
+        --retro-cpp-dir "$retro_out/cpp")
+fi
 log_step emit-build-shards "Preparing local native build shards"
-translator emit-build-shards --project "$project" --base-metadata "$base_metadata" \
-    --base-functions-dir "$functions" --native-source-dir "$workspace/runtime/src" --out "$shards"
+translator "${shard_args[@]}"
 
 # ---------------------------------------------------------------------------
 # Native configure + build. Every flag below exists specifically for cross-compiling to iOS - see
@@ -343,8 +509,16 @@ log_step configure-native "Configuring the iOS toolchain ($platform)"
     "${dawn_provider_args[@]}" \
     -DAURORA_SDL3_PROVIDER=vendor
 
-log_step compile "Compiling WiiCompiled for iOS ($platform)"
-"$cmake_bin" --build "$build" --target WiiCompiled --parallel "$global_jobs"
+case "$profile" in
+    base) targets=(WiiCompiled) ;;
+    retro-rewind) targets=(RetroRewind) ;;
+    both) targets=(WiiCompiled RetroRewind) ;;
+esac
+build_args=(--build "$build")
+for target in "${targets[@]}"; do build_args+=(--target "$target"); done
+build_args+=(--parallel "$global_jobs")
+log_step compile "Compiling ${targets[*]} for iOS ($platform)"
+"$cmake_bin" "${build_args[@]}"
 
 # ---------------------------------------------------------------------------
 # Package: patch the placeholder Info.plist ios.toolchain.cmake generates, bundle the extracted
@@ -353,16 +527,29 @@ log_step compile "Compiling WiiCompiled for iOS ($platform)"
 # .ipa. No codesign step anywhere in this script, deliberately - see the file header.
 # ---------------------------------------------------------------------------
 
-app_bundle=$build/$bundle_name.app
-assert_dir "$app_bundle" "Built .app bundle"
-
 case "$platform" in
     device) supported_platform=iPhoneOS; dt_platform_name=iphoneos ;;
     simulator) supported_platform=iPhoneSimulator; dt_platform_name=iphonesimulator ;;
 esac
+dol_sha=$(sha256_of "$assets/main.dol")
+rel_sha=$(sha256_of "$assets/StaticR.rel")
 
-log_step patch-info-plist "Writing the app's Info.plist"
-cat > "$app_bundle/Info.plist" <<PLIST
+package_built_product() {
+    # $1 = CMake target name (WiiCompiled/RetroRewind - this, not --bundle-name, is what the
+    # actual .app folder and the binary inside it are named; ios.toolchain.cmake names the bundle
+    # after the CMake target regardless of what Info.plist says). $2 = output directory.
+    # $3 = "base" or "retro-rewind", for the provenance file.
+    local target=$1 destination=$2 provenance_profile=$3
+    local app_bundle=$build/$target.app
+    assert_dir "$app_bundle" "Built .app bundle"
+
+    # RetroRewind needs a distinct CFBundleIdentifier from the base build so both can be installed
+    # on the same device at once, the same way they are two separate products on Windows/Linux.
+    local this_bundle_id=$bundle_id
+    [[ "$provenance_profile" == "retro-rewind" ]] && this_bundle_id="$bundle_id.retro"
+
+    log_step "patch-info-plist-$target" "Writing $target's Info.plist"
+    cat > "$app_bundle/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -370,9 +557,9 @@ cat > "$app_bundle/Info.plist" <<PLIST
 	<key>CFBundleDevelopmentRegion</key>
 	<string>English</string>
 	<key>CFBundleExecutable</key>
-	<string>$bundle_name</string>
+	<string>$target</string>
 	<key>CFBundleIdentifier</key>
-	<string>$bundle_id</string>
+	<string>$this_bundle_id</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -407,34 +594,53 @@ cat > "$app_bundle/Info.plist" <<PLIST
 </plist>
 PLIST
 
-log_step bundle-data "Bundling the extracted game data into the app"
-rsync -a --delete "$assets/DATA/" "$app_bundle/DATA/"
+    log_step "bundle-data-$target" "Bundling the extracted game data into $target"
+    rsync -a --delete "$assets/DATA/" "$app_bundle/DATA/"
 
-log_step package-ipa "Packaging an unsigned .ipa"
-payload_dir=$build/Payload
-rm -rf "$payload_dir"
-mkdir -p "$payload_dir"
-cp -R "$app_bundle" "$payload_dir/"
-mkdir -p "$output_dir"
-ipa_path=$output_dir/$bundle_name.ipa
-rm -f "$ipa_path"
-(cd "$build" && zip -r -X -y "$ipa_path" "Payload") >/dev/null
-rm -rf "$payload_dir"
+    log_step "package-ipa-$target" "Packaging $target as an unsigned .ipa"
+    local payload_dir=$build/Payload
+    rm -rf "$payload_dir"
+    mkdir -p "$payload_dir"
+    cp -R "$app_bundle" "$payload_dir/"
+    mkdir -p "$destination"
+    local ipa_path=$destination/$target.ipa
+    rm -f "$ipa_path"
+    (cd "$build" && zip -r -X -y "$ipa_path" "Payload") >/dev/null
+    rm -rf "$payload_dir"
 
-dol_sha=$(sha256_of "$assets/main.dol")
-rel_sha=$(sha256_of "$assets/StaticR.rel")
-built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-cat > "$output_dir/local-build-ios.json" <<JSON
+    local code_pul_sha=null
+    if [[ "$provenance_profile" == "retro-rewind" ]]; then
+        code_pul_sha=\"$(sha256_of "$retro_root/Binaries/Code.pul")\"
+    fi
+    local built_utc
+    built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$destination/local-build-ios.json" <<JSON
 {
   "SchemaVersion": 1,
+  "Profile": "$provenance_profile",
   "Platform": "$platform",
   "DeploymentTarget": "$deployment_target",
-  "BundleIdentifier": "$bundle_id",
+  "BundleIdentifier": "$this_bundle_id",
   "BuiltUtc": "$built_utc",
   "DolSha256": "$dol_sha",
   "RelSha256": "$rel_sha",
+  "CodePulSha256": $code_pul_sha,
   "Signed": false
 }
 JSON
 
-echo "MKWCBUILD:OUTPUT=$ipa_path"
+    echo "MKWCBUILD:OUTPUT=$ipa_path"
+}
+
+case "$profile" in
+    both)
+        package_built_product WiiCompiled "$base_output_dir" base
+        package_built_product RetroRewind "$output_dir" retro-rewind
+        ;;
+    retro-rewind)
+        package_built_product RetroRewind "$output_dir" retro-rewind
+        ;;
+    base)
+        package_built_product WiiCompiled "$output_dir" base
+        ;;
+esac
