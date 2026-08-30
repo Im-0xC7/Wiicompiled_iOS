@@ -1,6 +1,7 @@
 #include "settings_overlay.h"
 #include "audio_backend.h"
 #include "controller_mapping_wizard.h"
+#include "touch_controls.h"
 #include "game_graphics_options.h"
 #include "music_attenuation.h"
 #include "runtime_config.h"
@@ -311,6 +312,18 @@ void ApplyConfiguredMappings() {
 }
 
 void DrawControllerSettings() {
+    bool touchControlsEnabled = touch_controls::IsEnabled();
+    if (ImGui::Checkbox("Touch controls", &touchControlsEnabled)) {
+        touch_controls::SetEnabled(touchControlsEnabled);
+    }
+    bool gyroSteeringEnabled = touch_controls::IsGyroSteeringEnabled();
+    ImGui::BeginDisabled(!touchControlsEnabled);
+    if (ImGui::Checkbox("Gyro steering (tilt to steer)", &gyroSteeringEnabled)) {
+        touch_controls::SetGyroSteeringEnabled(gyroSteeringEnabled);
+    }
+    ImGui::EndDisabled();
+    ImGui::Separator();
+
     for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
         const std::string label = "Port " + std::to_string(port + 1);
         ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
@@ -880,6 +893,7 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             continue;
         }
         controller_mapping_wizard::HandleSdlEvent(ev->sdl);
+        touch_controls::HandleSdlEvent(ev->sdl);
         if (IsToggleKey(ev->sdl, SDL_SCANCODE_F10)) {
             SetTopBarVisible(!g_topBarVisible);
         }
@@ -902,6 +916,7 @@ void Draw() noexcept {
     DrawFpsOverlay();
     DrawTopBar();
     controller_mapping_wizard::Draw();
+    touch_controls::Draw();
     // The wizard captures raw presses; keep them out of the game.
     PADBlockInput(controller_mapping_wizard::IsActive());
     DrawStartupScreen();

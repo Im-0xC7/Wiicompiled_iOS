@@ -1,6 +1,7 @@
 #include "hle_stubs.h"
 #include "memory.h"
 #include "hle/controller_status_contract.h"
+#include "touch_controls.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -45,6 +46,7 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 
     PADStatus statuses[PAD_CHANMAX]{};
     uint32_t rumbleMask = PADRead(statuses);
+    touch_controls::ApplyOverlay(statuses, PAD_CHANMAX);
 
     try {
         for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {

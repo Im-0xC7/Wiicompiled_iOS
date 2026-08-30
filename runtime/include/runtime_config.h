@@ -66,6 +66,8 @@ struct RuntimeUserConfig {
     // comma-separated SDL-style physical button names ("south", or
     // "dpad_up,left_shoulder") as values; pressing either bound button counts.
     std::array<std::optional<std::string>, 12> controllerButtons;
+    std::optional<bool> touchControlsEnabled;
+    std::optional<bool> gyroSteeringEnabled;
 };
 
 namespace RuntimeConfigFile {
@@ -399,6 +401,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
         config.controllerButtons[index] =
             FindConfigValue<std::string>(document, "controller", buttonKeys[index]);
     }
+    config.touchControlsEnabled = FindConfigValue<bool>(document, "controller", "touch_controls_enabled");
+    config.gyroSteeringEnabled = FindConfigValue<bool>(document, "controller", "gyro_steering_enabled");
 
     config.widescreen = FindConfigValue<bool>(document, "video", "widescreen");
     config.windowPosX = FindConfigInt(document, "video", "window_x");
@@ -505,6 +509,13 @@ inline constexpr std::array<std::string_view, 12> kControllerButtonKeys = {
 inline const std::optional<std::string>& ControllerButton(size_t index) {
     static const std::optional<std::string> empty;
     return index < Get().controllerButtons.size() ? Get().controllerButtons[index] : empty;
+}
+
+// No fallback default here - callers decide it at runtime (touch-device/no-real-controller
+// presence), not this file, since that decision needs live SDL state this header doesn't have.
+inline std::optional<bool> TouchControlsEnabled() { return Get().touchControlsEnabled; }
+inline bool GyroSteeringEnabled(bool fallback = false) {
+    return Get().gyroSteeringEnabled.value_or(fallback);
 }
 
 // Update one TOML value without discarding comments, unrelated settings, or
@@ -660,6 +671,16 @@ inline bool SetControllerButton(size_t index, std::string value) {
     }
     Mutable().controllerButtons[index] = value;
     return WriteSetting("controller", kControllerButtonKeys[index], FormatString(value));
+}
+
+inline bool SetTouchControlsEnabled(bool value) {
+    Mutable().touchControlsEnabled = value;
+    return WriteSetting("controller", "touch_controls_enabled", value ? "true" : "false");
+}
+
+inline bool SetGyroSteeringEnabled(bool value) {
+    Mutable().gyroSteeringEnabled = value;
+    return WriteSetting("controller", "gyro_steering_enabled", value ? "true" : "false");
 }
 
 inline bool SetAudioVolume(float value) {
