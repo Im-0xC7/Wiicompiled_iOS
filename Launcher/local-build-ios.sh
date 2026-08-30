@@ -272,6 +272,15 @@ shards=$generated/build_shards
 build=$workspace/ios-build-$platform
 translation_provenance=$generated/translation-provenance.json
 
+# Must run before anything below extracts into $build (the Retro Rewind zip, the ios-cmake
+# toolchain fetch) or writes $generated/$base_manifest_dir - otherwise a forced clean build would
+# wipe out an extraction it had just done earlier in this same run, leaving e.g. retro_root
+# pointing at a directory that no longer exists by the time Code.pul is read from it.
+if (( force_clean_build )); then
+    log_step force-clean "A clean build was requested; discarding every translation and build cache"
+    rm -rf "$generated" "$base_manifest_dir" "$build"
+fi
+
 assert_file "$project" "Translation project"
 
 # Bash port of WiiCompiled.Setup.Linux/DiscTool.cs's ValidateAndExtractAsync: same nodtool
@@ -440,11 +449,6 @@ fi
 # the translation actually depends on; a match plus every expected output file present means the
 # previous translation is still good.
 # ---------------------------------------------------------------------------
-
-if (( force_clean_build )); then
-    log_step force-clean "A clean build was requested; discarding every translation and build cache"
-    rm -rf "$generated" "$base_manifest_dir" "$build"
-fi
 
 translation_fingerprint=$(cat "$assets/main.dol" "$assets/StaticR.rel" "$project" | shasum -a 256 | awk '{print $1}')
 reuse_base=0
