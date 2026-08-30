@@ -283,7 +283,11 @@ base_metadata=$generated/base_translation_output.json
 base_manifest_dir=$workspace/build/base
 base_manifest=$base_manifest_dir/mkwii_base_manifest.json
 shards=$generated/build_shards
-build=$workspace/ios-build-$platform
+# Under --output-dir, not the workspace root, so nothing lands outside the directory the caller
+# asked for. A single tree even for --profile both (which publishes to two directories, --output-dir
+# and --base-output-dir) - CMake builds both targets together, so there is only ever one native
+# build to place.
+build=$output_dir/ios-build-$platform
 translation_provenance=$generated/translation-provenance.json
 
 # Must run before anything below extracts into $build (the Retro Rewind zip, the ios-cmake
