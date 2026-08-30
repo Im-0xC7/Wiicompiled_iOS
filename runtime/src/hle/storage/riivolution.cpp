@@ -123,7 +123,7 @@ void RiivoAddRoot(std::vector<RuntimeRiivolution::Overlay>& overlays, fs::path r
 // A <savegame external="..."> path resolves relative to the SD root's parent - fine on
 // Windows/Linux, where that parent is a writable folder the user chose (see RiivoFindXmls). On
 // iOS the auto-discovered overlay root lives inside the read-only, code-signed .app bundle (see
-// RetroWfcOverlayPath in nand_path.h), so its parent is the bundle itself, and a write there fails
+// RetroRewindOverlayPath in nand_path.h), so its parent is the bundle itself, and a write there fails
 // with "Operation not supported". When the resolved save path falls inside the executable's own
 // directory, redirect it into the writable application data directory instead, keeping the same
 // path relative to the executable directory so different packs' saves stay distinct.
