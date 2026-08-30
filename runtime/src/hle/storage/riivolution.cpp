@@ -120,6 +120,26 @@ void RiivoAddRoot(std::vector<RuntimeRiivolution::Overlay>& overlays, fs::path r
     overlays.push_back({std::move(normalized), std::nullopt});
 }
 
+// A <savegame external="..."> path resolves relative to the SD root's parent - fine on
+// Windows/Linux, where that parent is a writable folder the user chose (see RiivoFindXmls). On
+// iOS the auto-discovered overlay root lives inside the read-only, code-signed .app bundle (see
+// RetroWfcOverlayPath in nand_path.h), so its parent is the bundle itself, and a write there fails
+// with "Operation not supported". When the resolved save path falls inside the executable's own
+// directory, redirect it into the writable application data directory instead, keeping the same
+// path relative to the executable directory so different packs' saves stay distinct.
+fs::path RedirectBundledSaveHostDirectory(fs::path saveHostDirectory) {
+    const auto executableDirectory = RuntimeConfigFile::ExecutableDirectory();
+    if (!executableDirectory) {
+        return saveHostDirectory;
+    }
+    std::error_code ec;
+    const fs::path relative = fs::relative(saveHostDirectory, *executableDirectory, ec);
+    if (ec || relative.empty() || relative.native().rfind("..", 0) == 0) {
+        return saveHostDirectory;
+    }
+    return RuntimeConfigFile::ApplicationDataDirectory() / "RiivolutionSave" / relative;
+}
+
 std::vector<RuntimeRiivolution::Overlay> RiivoDiscoverRoots() {
     std::vector<RuntimeRiivolution::Overlay> overlays;
 
@@ -316,8 +336,9 @@ std::optional<RuntimeRiivolution::PatchSet> RiivoLoadPatchSet(const fs::path& ov
                 if (const auto resolvedSave = RiivolutionContract::MakeAbsoluteFromRelative(
                         sdRootGeneric, xmlDirGeneric, savegame->external)) {
                     state.saveRedirect =
-                        RuntimeRiivolution::SaveRedirect{PathFromUtf8(*resolvedSave),
-                                                         savegame->clone};
+                        RuntimeRiivolution::SaveRedirect{
+                            RedirectBundledSaveHostDirectory(PathFromUtf8(*resolvedSave)),
+                            savegame->clone};
                     RT_LOG(RT_TAG_RIIVOLUTION) << "savegame redirect: "
                               << PathToUtf8(state.saveRedirect->hostDirectory)
                               << (savegame->clone ? " (clone)" : "") << std::endl;
