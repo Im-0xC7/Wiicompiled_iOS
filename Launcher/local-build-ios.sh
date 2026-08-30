@@ -24,6 +24,11 @@
 # sideloading tool such as AltStore/Sideloadly/Impactor, TrollStore, etc.) needs the user's own
 # Apple ID and signing tool regardless of how the IPA was built, so this script deliberately stops
 # at the last step it can actually automate and leaves signing to whatever the user already uses.
+#
+# --simulator skips all of that: the Simulator needs no signing at all, so instead of packaging an
+# .ipa this builds for SIMULATORARM64, installs the .app straight into a booted (or freshly booted)
+# iOS Simulator, and launches it with its console streamed live - a fast dev loop with no device,
+# no sideloading tool, and no --output-dir.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -110,7 +115,7 @@ workspace=$(cd "$script_dir/.." && pwd)
 output_dir=""
 base_output_dir=""
 game_dump=""
-platform=device
+run_simulator=0
 profile=base
 retro_rewind_zip=""
 retro_rewind_dir=""
@@ -142,9 +147,12 @@ Usage: local-build-ios.sh --output-dir DIR [options]
                                 project's pinned game ID and main.dol/StaticR.rel hashes. Skipped if
                                 Assets/ already has an extracted dump (see the plain assert_file
                                 errors below for how to place one there yourself instead).
-  --platform {device|simulator}  Build target (default: device). Device uses a prebuilt Dawn
-                                package (fast); simulator builds Dawn from source (slow, but lets
-                                you iterate without a physical device or a signing step at all).
+  --simulator                   Build for the iOS Simulator instead of a real device (from-source
+                                Dawn, slower to configure but no signing step at all), skip .ipa
+                                packaging, and instead install + launch the app directly in a
+                                booted (or freshly booted) Simulator with its console streamed live.
+                                --output-dir/--base-output-dir are not used and --profile both is
+                                not supported (there would be two apps to launch).
   --profile {base|retro-rewind|both}   Build profile (default: base)
   --retro-rewind-zip PATH      The Retro Rewind distribution as downloaded from rwfc.net (a zip
                                 containing RetroRewind6, possibly under one wrapper folder)
@@ -184,7 +192,7 @@ while [[ $# -gt 0 ]]; do
         --output-dir) output_dir=$2; shift 2 ;;
         --base-output-dir) base_output_dir=$2; shift 2 ;;
         --game) game_dump=$2; shift 2 ;;
-        --platform) platform=$2; shift 2 ;;
+        --simulator) run_simulator=1; shift ;;
         --profile) profile=$2; shift 2 ;;
         --retro-rewind-zip) retro_rewind_zip=$2; shift 2 ;;
         --retro-rewind-dir) retro_rewind_dir=$2; shift 2 ;;
@@ -208,16 +216,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$output_dir" ]] || { usage; fail "--output-dir is required"; }
-case "$platform" in
-    device|simulator) ;;
-    *) fail "--platform must be device or simulator" ;;
-esac
 case "$profile" in
     base|retro-rewind|both) ;;
     *) fail "--profile must be base, retro-rewind, or both" ;;
 esac
 [[ "$(uname -s)" == "Darwin" ]] || fail "this script drives Xcode's iOS SDK and must run on macOS"
+
+platform=device
+if (( run_simulator )); then
+    platform=simulator
+    [[ "$profile" == "both" ]] && \
+        fail "--simulator does not support --profile both (there would be two apps to launch) - pass --profile base or --profile retro-rewind."
+    if [[ -n "$output_dir" || -n "$base_output_dir" ]]; then
+        fail "--output-dir/--base-output-dir are not used with --simulator; the built app launches directly instead of being packaged."
+    fi
+else
+    [[ -n "$output_dir" ]] || { usage; fail "--output-dir is required"; }
+fi
 
 builds_retro=0
 [[ "$profile" == "retro-rewind" || "$profile" == "both" ]] && builds_retro=1
@@ -248,7 +263,7 @@ if [[ "$profile" != "both" && -n "$base_output_dir" ]]; then
     fail "--base-output-dir is valid only with --profile both."
 fi
 
-output_dir=$(to_absolute "$output_dir")
+[[ -n "$output_dir" ]] && output_dir=$(to_absolute "$output_dir")
 [[ -n "$base_output_dir" ]] && base_output_dir=$(to_absolute "$base_output_dir")
 
 # ---------------------------------------------------------------------------
@@ -288,8 +303,9 @@ shards=$generated/build_shards
 # Under --output-dir, not the workspace root, so nothing lands outside the directory the caller
 # asked for. A single tree even for --profile both (which publishes to two directories, --output-dir
 # and --base-output-dir) - CMake builds both targets together, so there is only ever one native
-# build to place.
-build=$output_dir/ios-build-$platform
+# build to place. --simulator has no --output-dir at all (nothing gets packaged there), so its
+# build tree falls back to the workspace root, same as before --output-dir existed.
+build=${output_dir:-$workspace}/ios-build-$platform
 translation_provenance=$generated/translation-provenance.json
 
 # Must run before anything below extracts into $build (the Retro Rewind zip, the ios-cmake
@@ -639,8 +655,9 @@ log_step compile "Compiling ${targets[*]} for iOS ($platform)"
 # ---------------------------------------------------------------------------
 # Package: patch the placeholder Info.plist ios.toolchain.cmake generates, bundle the extracted
 # game data into the app (there is no on-device way to point a fresh install at a dvd_root outside
-# its own sandboxed container - see runtime_config.h's ResolvedDvdRoot), and zip into an unsigned
-# .ipa. No codesign step anywhere in this script, deliberately - see the file header.
+# its own sandboxed container - see runtime_config.h's ResolvedDvdRoot), and either zip into an
+# unsigned .ipa or (--simulator) install + launch it directly. No codesign step anywhere in this
+# script, deliberately - see the file header.
 # ---------------------------------------------------------------------------
 
 case "$platform" in
@@ -650,24 +667,29 @@ esac
 dol_sha=$(sha256_of "$assets/main.dol")
 rel_sha=$(sha256_of "$assets/StaticR.rel")
 
-package_built_product() {
-    # $1 = CMake target name (WiiCompiled/RetroRewind - this, not --bundle-name, is what the
-    # actual .app folder and the binary inside it are named; ios.toolchain.cmake names the bundle
-    # after the CMake target regardless of what Info.plist says). $2 = output directory.
-    # $3 = "base" or "retro-rewind", for the provenance file.
-    local target=$1 destination=$2 provenance_profile=$3
-    local app_bundle=$build/$target.app
-    assert_dir "$app_bundle" "Built .app bundle"
-
-    # RetroRewind needs a distinct CFBundleIdentifier from the base build so both can be installed
-    # on the same device at once, the same way they are two separate products on Windows/Linux -
+resolve_target_identity() {
+    # $1 = "base" or "retro-rewind". Sets this_bundle_id/this_bundle_name - deliberately not
+    # `local`, since both prepare_app_bundle's Info.plist and launch_in_simulator's simctl launch
+    # need the same values. RetroRewind needs a distinct CFBundleIdentifier from the base build so
+    # both can be installed at once, the same way they are two separate products on Windows/Linux -
     # and a distinct SpringBoard name/icon label, so the two are told apart once both are installed.
-    local this_bundle_id=$bundle_id
-    local this_bundle_name=$bundle_name
-    if [[ "$provenance_profile" == "retro-rewind" ]]; then
+    this_bundle_id=$bundle_id
+    this_bundle_name=$bundle_name
+    if [[ "$1" == "retro-rewind" ]]; then
         this_bundle_id="$bundle_id.retro"
         this_bundle_name="Retro Rewind"
     fi
+}
+
+prepare_app_bundle() {
+    # $1 = CMake target name (WiiCompiled/RetroRewind - this, not --bundle-name, is what the
+    # actual .app folder and the binary inside it are named; ios.toolchain.cmake names the bundle
+    # after the CMake target regardless of what Info.plist says). $2 = "base" or "retro-rewind".
+    # Leaves the patched .app at $build/$target.app - shared by IPA packaging and --simulator.
+    local target=$1 provenance_profile=$2
+    local app_bundle=$build/$target.app
+    assert_dir "$app_bundle" "Built .app bundle"
+    resolve_target_identity "$provenance_profile"
 
     log_step "patch-info-plist-$target" "Writing $target's Info.plist"
     cat > "$app_bundle/Info.plist" <<PLIST
@@ -730,6 +752,15 @@ PLIST
         log_step "bundle-retro-overlay-$target" "Bundling the Retro Rewind overlay into $target"
         rsync -a --delete "$retro_root/" "$app_bundle/RetroRewind6/"
     fi
+}
+
+package_built_product() {
+    # $1 = CMake target name, $2 = output directory, $3 = "base" or "retro-rewind" (also the
+    # provenance file's Profile field).
+    local target=$1 destination=$2 provenance_profile=$3
+    prepare_app_bundle "$target" "$provenance_profile"
+    local app_bundle=$build/$target.app
+    resolve_target_identity "$provenance_profile"
 
     log_step "package-ipa-$target" "Packaging $target as an unsigned .ipa"
     local payload_dir=$build/Payload
@@ -765,6 +796,54 @@ JSON
 
     echo "MKWCBUILD:OUTPUT=$ipa_path"
 }
+
+find_or_boot_simulator() {
+    # Prefers whatever is already booted (fast, and respects a device the caller picked by hand);
+    # otherwise boots the first available iPhone simulator. Plain-text simctl output, not `-j`, to
+    # avoid adding a jq dependency for the one field this needs - same tradeoff local-build-ios.sh
+    # already makes for `nodtool info` elsewhere in this script.
+    #
+    # The caller captures this function's stdout as its return value (device_udid=$(...)), so
+    # every other command's own output - log_step included, which is stdout by design elsewhere in
+    # this script, see its own comment - is redirected to stderr here to keep that channel clean.
+    local udid
+    udid=$(xcrun simctl list devices booted | grep -m1 -oE '[0-9A-Fa-f-]{36}')
+    if [[ -n "$udid" ]]; then
+        printf '%s\n' "$udid"
+        return
+    fi
+
+    log_step simulator-boot "No booted simulator found; booting one" >&2
+    udid=$(xcrun simctl list devices available | grep -m1 "iPhone" | grep -oE '[0-9A-Fa-f-]{36}')
+    [[ -n "$udid" ]] || fail "no available iPhone simulator found (xcrun simctl list devices available) - create one in Xcode first"
+    xcrun simctl boot "$udid" >&2
+    open -a Simulator >&2
+    xcrun simctl bootstatus "$udid" -b >&2
+    printf '%s\n' "$udid"
+}
+
+launch_in_simulator() {
+    # $1 = CMake target name, $2 = "base" or "retro-rewind".
+    local target=$1 provenance_profile=$2
+    prepare_app_bundle "$target" "$provenance_profile"
+    local app_bundle=$build/$target.app
+    resolve_target_identity "$provenance_profile"
+
+    local device_udid
+    device_udid=$(find_or_boot_simulator)
+    log_step simulator-install "Installing $target into simulator $device_udid"
+    xcrun simctl install "$device_udid" "$app_bundle"
+    log_step simulator-launch "Launching $target - streaming its console (Ctrl+C to stop)"
+    xcrun simctl launch --console "$device_udid" "$this_bundle_id"
+}
+
+if (( run_simulator )); then
+    case "$profile" in
+        retro-rewind) launch_in_simulator RetroRewind retro-rewind ;;
+        base) launch_in_simulator WiiCompiled base ;;
+    esac
+    exit 0
+fi
 
 case "$profile" in
     both)
