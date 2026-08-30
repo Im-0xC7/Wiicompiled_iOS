@@ -691,6 +691,10 @@ prepare_app_bundle() {
     assert_dir "$app_bundle" "Built .app bundle"
     resolve_target_identity "$provenance_profile"
 
+    # UILaunchScreen (even empty) is what tells iOS this app declares a modern launch screen at
+    # all; without it (or a real .storyboard, which this script does not ship), iOS renders the
+    # app in a legacy compatibility mode sized for pre-iPhone-6 screens and letterboxes/scales it
+    # up instead of using the device's full native resolution.
     log_step "patch-info-plist-$target" "Writing $target's Info.plist"
     cat > "$app_bundle/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -735,6 +739,8 @@ prepare_app_bundle() {
 	<array>
 		<string>arm64</string>
 	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
 </dict>
 </plist>
 PLIST
