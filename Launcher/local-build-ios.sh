@@ -98,6 +98,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace=$(cd "$script_dir/.." && pwd)
 output_dir=""
 base_output_dir=""
+game_dump=""
 platform=device
 profile=base
 retro_rewind_zip=""
@@ -125,6 +126,11 @@ Usage: local-build-ios.sh --output-dir DIR [options]
   --workspace DIR              Repository root (default: this script's parent directory)
   --output-dir DIR             Where the built .ipa is published (required)
   --base-output-dir DIR        Second output directory; required with --profile both
+  --game PATH                  Your own Mario Kart Wii disc image (ISO/WBFS/etc, whatever nodtool
+                                reads). Extracted into Assets/ via nodtool, validated against this
+                                project's pinned game ID and main.dol/StaticR.rel hashes. Skipped if
+                                Assets/ already has an extracted dump (see the plain assert_file
+                                errors below for how to place one there yourself instead).
   --platform {device|simulator}  Build target (default: device). Device uses a prebuilt Dawn
                                 package (fast); simulator builds Dawn from source (slow, but lets
                                 you iterate without a physical device or a signing step at all).
@@ -164,6 +170,7 @@ while [[ $# -gt 0 ]]; do
         --workspace) workspace=$(cd "$2" && pwd); shift 2 ;;
         --output-dir) output_dir=$2; shift 2 ;;
         --base-output-dir) base_output_dir=$2; shift 2 ;;
+        --game) game_dump=$2; shift 2 ;;
         --platform) platform=$2; shift 2 ;;
         --profile) profile=$2; shift 2 ;;
         --retro-rewind-zip) retro_rewind_zip=$2; shift 2 ;;
@@ -259,6 +266,76 @@ build=$workspace/ios-build-$platform
 translation_provenance=$generated/translation-provenance.json
 
 assert_file "$project" "Translation project"
+
+# Bash port of WiiCompiled.Setup.Linux/DiscTool.cs's ValidateAndExtractAsync: same nodtool
+# info/extract invocations, same game-ID-before-extracting fail-fast check, same
+# main.dol/StaticR.rel sha256 pins (read here from recomp.yml, the same "literal line matching"
+# approach ProjectManifest.cs and this script's entry_point parsing already use). Skips extraction
+# entirely if Assets/ is already populated, so a repeat build never re-runs nodtool.
+if [[ -n "$game_dump" ]]; then
+    if [[ -d "$assets/DATA" && -f "$assets/main.dol" && -f "$assets/StaticR.rel" ]]; then
+        log_step skip-extract-game "Assets/ already has an extracted game dump; skipping --game"
+    else
+        assert_file "$game_dump" "Game dump"
+        require_command nodtool nodtool
+
+        pinned_game_id=$(awk '
+            /^project:/ { in_project = 1; next }
+            /^[A-Za-z0-9_]+:/ { in_project = 0 }
+            in_project && /^[[:space:]]*game_id:/ {
+                gsub(/^[[:space:]]*game_id:[[:space:]]*/, ""); gsub(/[[:space:]]*$/, ""); print; exit
+            }
+        ' "$project")
+        pinned_dol_sha=$(awk '
+            /^inputs:/ { in_inputs = 1; next }
+            /^[A-Za-z0-9_]+:/ { in_inputs = 0 }
+            in_inputs && /^[[:space:]]{2}dol:[[:space:]]*$/ { in_dol = 1; next }
+            in_inputs && /^[[:space:]]{2}[A-Za-z0-9_]+:[[:space:]]*$/ { in_dol = 0 }
+            in_dol && /^[[:space:]]*sha256:/ {
+                gsub(/^[[:space:]]*sha256:[[:space:]]*/, ""); gsub(/[[:space:]]*$/, ""); print; exit
+            }
+        ' "$project")
+        pinned_rel_sha=$(awk '
+            /^inputs:/ { in_inputs = 1; next }
+            /^[A-Za-z0-9_]+:/ { in_inputs = 0 }
+            in_inputs && /^[[:space:]]{2}rel:[[:space:]]*$/ { in_rel = 1; next }
+            in_inputs && /^[[:space:]]{2}[A-Za-z0-9_]+:[[:space:]]*$/ { in_rel = 0 }
+            in_rel && /^[[:space:]]*sha256:/ {
+                gsub(/^[[:space:]]*sha256:[[:space:]]*/, ""); gsub(/[[:space:]]*$/, ""); print; exit
+            }
+        ' "$project")
+        [[ -n "$pinned_game_id" && -n "$pinned_dol_sha" && -n "$pinned_rel_sha" ]] || \
+            fail "$project does not pin project.game_id/inputs.dol.sha256/inputs.rel.sha256; the project file is not the shape --game expects."
+
+        log_step read-game-header "Reading the game dump's disc header"
+        disc_info=$(nodtool info "$game_dump") || fail "nodtool could not read this disc image: $game_dump"
+        disc_game_id=$(printf '%s\n' "$disc_info" | awk '/^Game ID: / { print $3; exit }')
+        [[ "$disc_game_id" == "$pinned_game_id" ]] || \
+            fail "$game_dump is '$disc_game_id', not the expected '$pinned_game_id'. Only your own legally-owned copy of that exact game/region can be used."
+
+        log_step extract-game "Extracting the game dump into Assets/DATA"
+        rm -rf "$assets/DATA"
+        mkdir -p "$assets"
+        nodtool extract "$game_dump" "$assets/DATA" -q
+
+        game_dol=$assets/DATA/sys/main.dol
+        game_rel=$assets/DATA/files/rel/StaticR.rel
+        assert_file "$game_dol" "nodtool-extracted main.dol"
+        assert_file "$game_rel" "nodtool-extracted StaticR.rel"
+
+        game_dol_sha=$(sha256_of "$game_dol")
+        [[ "$game_dol_sha" == "$pinned_dol_sha" ]] || \
+            fail "main.dol sha256 mismatch: expected $pinned_dol_sha, got $game_dol_sha. This disc revision does not match what $project is pinned to."
+        game_rel_sha=$(sha256_of "$game_rel")
+        [[ "$game_rel_sha" == "$pinned_rel_sha" ]] || \
+            fail "StaticR.rel sha256 mismatch: expected $pinned_rel_sha, got $game_rel_sha. This disc revision does not match what $project is pinned to."
+
+        cp "$game_dol" "$assets/main.dol"
+        cp "$game_rel" "$assets/StaticR.rel"
+        log_step extract-game-done "Game dump validated and extracted"
+    fi
+fi
+
 assert_file "$assets/main.dol" "Extracted main.dol (see translator/README.md - owning the game is required; nodtool extract your own disc image into Assets/ first)"
 assert_file "$assets/StaticR.rel" "Extracted StaticR.rel (see translator/README.md - owning the game is required; nodtool extract your own disc image into Assets/ first)"
 assert_dir "$assets/DATA" "Extracted DATA directory (nodtool extract your own disc image into Assets/DATA - this gets bundled into the app)"
