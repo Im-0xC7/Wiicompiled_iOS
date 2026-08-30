@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <optional>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace touch_controls {
 namespace {
 
@@ -231,18 +235,32 @@ void HandlePressZone(TouchZone& zone, const SDL_TouchFingerEvent& finger, const 
     }
 }
 
-bool WantsTouchControls() {
-    if (const auto configured = RuntimeConfigFile::TouchControlsEnabled()) {
-        return *configured;
-    }
-    // No explicit user choice recorded yet: default on only when there's an actual touch
-    // device and nothing already driving port 0, so desktop/controller play is untouched.
+// SDL3's touch-device list is populated lazily on this platform - SDL_GetTouchDevices() reports
+// none at all until the first real touch event has actually occurred, which makes it useless as
+// an *up-front* "should touch controls be visible" signal: nothing would ever show them for the
+// player to make that first touch with. iOS (device or Simulator - TARGET_OS_IOS covers both) is
+// unconditionally touch-capable, so that's the primary signal there; SDL_GetTouchDevices() stays
+// as a fallback for any other platform with real, already-detected touch hardware.
+bool IsInherentlyTouchCapable() {
+#if defined(__APPLE__) && TARGET_OS_IOS
+    return true;
+#else
     int touchDeviceCount = 0;
     SDL_TouchID* devices = SDL_GetTouchDevices(&touchDeviceCount);
     if (devices) {
         SDL_free(devices);
     }
-    return touchDeviceCount > 0 && PADGetIndexForPort(0) < 0;
+    return touchDeviceCount > 0;
+#endif
+}
+
+bool WantsTouchControls() {
+    if (const auto configured = RuntimeConfigFile::TouchControlsEnabled()) {
+        return *configured;
+    }
+    // No explicit user choice recorded yet: default on only when nothing is already driving
+    // port 0, so desktop/controller play is untouched.
+    return IsInherentlyTouchCapable() && PADGetIndexForPort(0) < 0;
 }
 
 } // namespace
