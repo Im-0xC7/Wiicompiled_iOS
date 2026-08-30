@@ -68,11 +68,26 @@ function(mkw_configure_translated_target target)
     mkw_bound_translated_compiles(${target})
 endfunction()
 
+# iOS has no free-standing process entry point the way desktop platforms do - UIApplicationMain()
+# has to run first and drive the real app lifecycle before any window/GPU surface can exist, and
+# SDL3 supplies that (a real main() that calls UIApplicationMain(), which eventually invokes the
+# renamed SDL_main from inside a properly running UIKit app). SDL_MAIN_HANDLED opts out of that
+# and is correct for desktop platforms, where main.cpp's own plain main() legitimately owns
+# startup ordering (config/log setup before anything SDL-related runs), but on iOS it just
+# produces "Application didn't initialize properly" from SDL_Init since no UIApplication was ever
+# started. main.cpp's `int main(int argc, char** argv)` already matches the signature SDL3's
+# SDL_main.h macro-renames, so no source change is needed - only this definition.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(MKW_SDL_MAIN_DEFS)
+else()
+    set(MKW_SDL_MAIN_DEFS SDL_MAIN_HANDLED)
+endif()
+
 add_library(mkw_runtime_common OBJECT ${SOURCES})
 mkw_configure_object_target(mkw_runtime_common)
 target_compile_features(mkw_runtime_common PRIVATE cxx_std_20)
 target_compile_definitions(mkw_runtime_common PRIVATE
-    SDL_MAIN_HANDLED
+    ${MKW_SDL_MAIN_DEFS}
     _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
 target_link_libraries(mkw_runtime_common PRIVATE
     aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
@@ -183,7 +198,7 @@ function(mkw_configure_product target)
         "${MKW_RUNTIME_SOURCE_DIR}/.."
         "${MKW_RUNTIME_SOURCE_DIR}/../aurora-main/include")
     target_compile_definitions(${target} PRIVATE
-        SDL_MAIN_HANDLED _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION TARGET_PC)
+        ${MKW_SDL_MAIN_DEFS} _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION TARGET_PC)
     target_compile_features(${target} PRIVATE cxx_std_20)
     mkw_apply_common_compile_options(${target})
     # The dispatch-table and registration shards compile inside the product target itself and
@@ -298,11 +313,23 @@ else()
     message(STATUS "RetroRewind target disabled (run translate-mod and emit-build-shards)")
 endif()
 
+# x86-64-v3 (Haswell/Excavator-and-newer AVX2 baseline) is an x86-specific tuning
+# policy; it has no meaning on arm64 and clang rejects it there. On Apple
+# platforms, every M-series/A-series arm64 chip is a single fixed baseline that
+# Xcode's clang already targets correctly by default, so mkw_cpu_baseline's
+# runtime CPUID guard (see host_cpu_baseline.cpp) is the only place arch
+# gating happens there - no compile flag is needed or applied.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    set(MKW_ARCH_TUNING_FLAGS -march=x86-64-v3)
+else()
+    set(MKW_ARCH_TUNING_FLAGS)
+endif()
+
 set(MKW_ALL_BUILD_TARGETS
     mkw_runtime_common mkw_base_shared mkw_base_sensitive mkw_retro_sensitive
     mkw_retro_rewind_functions WiiCompiled RetroRewind)
 foreach(target IN LISTS MKW_ALL_BUILD_TARGETS)
-    if(TARGET ${target})
-        target_compile_options(${target} PRIVATE -march=x86-64-v3)
+    if(TARGET ${target} AND MKW_ARCH_TUNING_FLAGS)
+        target_compile_options(${target} PRIVATE ${MKW_ARCH_TUNING_FLAGS})
     endif()
 endforeach()

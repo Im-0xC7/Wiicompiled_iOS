@@ -98,9 +98,15 @@ if (_aurora_dawn_provider STREQUAL "vendor")
       set(ABSL_MSVC_STATIC_RUNTIME ON CACHE INTERNAL "Link static runtime libraries")
     endif ()
 
+    # AURORA_DAWN_VERSION's default value (see CMakeLists.txt) is a dawn-build release tag
+    # (date-based build id), not a google/dawn git tag - that release's own notes name the actual
+    # upstream commit it was built from, which is what this should be pointed at for vendor mode.
+    # The plain archive/{ref}.tar.gz endpoint (no refs/tags/ prefix) resolves tags, branches, and
+    # raw commit SHAs uniformly, unlike the tag-only refs/tags/ endpoint - use that so both a real
+    # tag and a commit SHA work here.
     include(FetchContent)
     FetchContent_Declare(dawn
-      URL "https://github.com/google/dawn/archive/refs/tags/${AURORA_DAWN_VERSION}.tar.gz"
+      URL "https://github.com/google/dawn/archive/${AURORA_DAWN_VERSION}.tar.gz"
       DOWNLOAD_EXTRACT_TIMESTAMP TRUE
       EXCLUDE_FROM_ALL
     )

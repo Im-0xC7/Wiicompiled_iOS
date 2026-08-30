@@ -3,10 +3,22 @@ include(FetchContent)
 # Don't build tests for third party dependencies
 set(BUILD_TESTING OFF CACHE INTERNAL "Build tests")
 set(SKIP_INSTALL_ALL ON)
-if (NOT DEFINED BUILD_SHARED_LIBS)
-  set(_USE_SHARED ON)
+# NOT DEFINED BUILD_SHARED_LIBS alone doesn't reliably track this project's actual static/shared
+# intent for a cross-compile (e.g. a plain `-DBUILD_SHARED_LIBS=OFF` on the configure command line
+# does not necessarily survive as a defined cache entry through every FetchContent sub-build in
+# this tree, which left PNG/Freetype/zlib built shared even when Dawn/SDL3 correctly resolved to
+# static). Mirror the linkage this project's own CMakeLists.txt already computes correctly for
+# Dawn/SDL3 instead: static whenever cross-compiling (an iOS/tvOS/simulator app can't casually
+# embed and code-sign arbitrary bundled dylibs the way a desktop build can), shared only for a
+# native build with no linkage preference set.
+if (CMAKE_CROSSCOMPILING OR DEFINED BUILD_SHARED_LIBS)
+  if (CMAKE_CROSSCOMPILING)
+    set(_USE_SHARED OFF)
+  else ()
+    set(_USE_SHARED ${BUILD_SHARED_LIBS})
+  endif ()
 else ()
-  set(_USE_SHARED OFF)
+  set(_USE_SHARED ON)
 endif ()
 
 function(aurora_find_package_global)

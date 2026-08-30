@@ -1,13 +1,14 @@
 ﻿cmake_minimum_required(VERSION 3.16)
 project(mkw_recompiled)
 
-if((NOT (WIN32 AND MINGW)) AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-    message(FATAL_ERROR "WiiCompiled requires Windows (LLVM-MinGW) or native Linux")
+if((NOT (WIN32 AND MINGW)) AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") AND (NOT APPLE))
+    message(FATAL_ERROR "WiiCompiled requires Windows (LLVM-MinGW), native Linux, or an Apple platform (macOS/iOS)")
 endif()
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$" OR
    NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
-   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-    message(FATAL_ERROR "WiiCompiled requires 64-bit Clang targeting x86_64")
+   NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$" OR
+        (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")))
+    message(FATAL_ERROR "WiiCompiled requires 64-bit Clang targeting x86_64, or arm64 Clang on Apple platforms")
 endif()
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
@@ -134,16 +135,33 @@ else()
         set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
         set(TINT_BUILD_HLSL_WRITER ON CACHE BOOL "" FORCE)
         set(DAWN_USE_WINDOWS_UI OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
+    elseif(APPLE)
+        # macOS/iOS: mirrors aurora-main's own _aurora_dawn_set_platform_backends()
+        # choice for APPLE - Metal only. No Vulkan loader/MoltenVK dependency is
+        # introduced; Dawn's Cocoa/UIKit surface path (BackendBinding.cpp) is shared
+        # between macOS and iOS already. Kept explicit here (rather than left to
+        # aurora's own un-FORCEd default) for the same reason the Linux branch below
+        # is explicit: this project's CMake FORCEs these cache variables before
+        # aurora-main's add_subdirectory() runs, which pre-empts aurora's own
+        # auto-detection (CACHE ... INTERNAL "" without FORCE never overrides an
+        # existing value).
+        set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
+        set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL ON CACHE BOOL "" FORCE)
     else()
-        # Non-Windows (Linux): mirrors aurora-main's own
+        # Non-Windows, non-Apple (Linux): mirrors aurora-main's own
         # _aurora_dawn_set_platform_backends() choice for this platform - Vulkan only, no
         # D3D/HLSL. Kept in sync here because this project's own CMake FORCEs these cache
         # variables before aurora-main's add_subdirectory() runs, which pre-empts aurora's
         # auto-detection (CACHE ... INTERNAL "" without FORCE never overrides an existing value).
         set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
         set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
     endif()
-    set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
     set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
     set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
