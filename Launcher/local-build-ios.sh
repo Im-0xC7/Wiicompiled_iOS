@@ -626,20 +626,49 @@ elif [[ "$keep_native_build" -eq 1 ]]; then
     echo "MKWCBUILD: Reusing the incremental native build directory"
 fi
 
-log_step configure-native "Configuring the iOS toolchain ($platform)"
-"$cmake_bin" -S "$workspace/runtime" -B "$build" -G Ninja \
-    -DCMAKE_TOOLCHAIN_FILE="$ios_toolchain" \
-    -DPLATFORM="$cmake_platform" \
-    -DDEPLOYMENT_TARGET="$deployment_target" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_MAKE_PROGRAM="$ninja_bin" \
-    -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" \
-    -DCMAKE_SYSTEM_IGNORE_PATH=/opt/homebrew \
-    -DCMAKE_IGNORE_PATH=/opt/homebrew \
-    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-    "${dawn_provider_args[@]}" \
+configure_args=(
+    -DCMAKE_TOOLCHAIN_FILE="$ios_toolchain"
+    -DPLATFORM="$cmake_platform"
+    -DDEPLOYMENT_TARGET="$deployment_target"
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_MAKE_PROGRAM="$ninja_bin"
+    -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs"
+    -DCMAKE_SYSTEM_IGNORE_PATH=/opt/homebrew
+    -DCMAKE_IGNORE_PATH=/opt/homebrew
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+    "${dawn_provider_args[@]}"
     -DAURORA_SDL3_PROVIDER=vendor
+)
+# Re-running `cmake -S -B` unconditionally on every invocation - even against an already-configured,
+# unchanged tree - regenerates build.ninja from scratch every time. Verified directly: doing that
+# against an up-to-date ios-build-simulator tree made Ninja start recompiling vendored third-party
+# code (cryptopp) that had not changed at all - CMake's from-scratch regeneration isn't guaranteed
+# byte-identical run to run even with identical inputs, and Ninja treats any changed command line as
+# reason enough to rebuild. Ninja's own CONFIGURE_DEPENDS-driven regenerate rule (the "Re-checking
+# globbed directories..."/"Re-running CMake..." steps already visible in its own output, from
+# runtime/CMakeLists.txt's `file(GLOB_RECURSE ... CONFIGURE_DEPENDS ...)`) is the cheap, correct way
+# to catch real changes - it only actually reconfigures when a tracked input file changed. So: only
+# pay for an explicit reconfigure when the exact configure inputs changed since the last one (a
+# fingerprint of $configure_args, not individual CMakeCache.txt lookups - simpler than matching each
+# cached variable's own :TYPE= suffix, and correct for any future flag added to this array); a
+# reused cache with identical inputs skips straight to `cmake --build`, which is what invokes Ninja's
+# own regenerate check.
+configure_fingerprint_file=$build/.local-build-ios-configure-args
+configure_fingerprint=$(printf '%s\n' "${configure_args[@]}" | shasum -a 256 | awk '{print $1}')
+run_configure=1
+if [[ "$keep_native_build" -eq 1 && -f "$configure_fingerprint_file" && \
+    "$(cat "$configure_fingerprint_file")" == "$configure_fingerprint" ]]; then
+    run_configure=0
+fi
+
+if (( run_configure )); then
+    log_step configure-native "Configuring the iOS toolchain ($platform)"
+    "$cmake_bin" -S "$workspace/runtime" -B "$build" -G Ninja "${configure_args[@]}"
+    printf '%s' "$configure_fingerprint" > "$configure_fingerprint_file"
+else
+    log_step configure-native-skip "Configure inputs unchanged for ($platform); reusing the existing CMake configuration"
+fi
 
 case "$profile" in
     base) targets=(WiiCompiled) ;;
