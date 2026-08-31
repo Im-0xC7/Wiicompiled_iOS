@@ -1,5 +1,7 @@
 #include "dolphin/gx/GXAurora.h"
 
+#include <SDL3/SDL_video.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -72,6 +74,24 @@ void AuroraGetSurfaceSize(u32* width, u32* height) {
   }
   if (height != nullptr) {
     *height = windowSize.native_fb_height;
+  }
+}
+
+void AuroraGetSafeAreaInsets(f32* left, f32* top, f32* right, f32* bottom) {
+  const auto windowSize = aurora::window::get_window_size();
+  SDL_Rect safeRect{0, 0, static_cast<int>(windowSize.width), static_cast<int>(windowSize.height)};
+  SDL_GetWindowSafeArea(aurora::window::get_sdl_window(), &safeRect);
+  if (left != nullptr) {
+    *left = static_cast<f32>(safeRect.x);
+  }
+  if (top != nullptr) {
+    *top = static_cast<f32>(safeRect.y);
+  }
+  if (right != nullptr) {
+    *right = static_cast<f32>(windowSize.width) - static_cast<f32>(safeRect.x + safeRect.w);
+  }
+  if (bottom != nullptr) {
+    *bottom = static_cast<f32>(windowSize.height) - static_cast<f32>(safeRect.y + safeRect.h);
   }
 }
 

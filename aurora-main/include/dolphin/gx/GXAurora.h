@@ -105,6 +105,14 @@ void AuroraGetRenderSize(u32* width, u32* height);
 void AuroraGetSurfaceSize(u32* width, u32* height);
 
 /**
+ * Retrieves the current window's safe-area insets, in the same point-space as the window size
+ * (e.g. what ImGui's io.DisplaySize uses) - the margin on each edge that is obscured or
+ * non-interactive (notches, Dynamic Island, rounded corners, home indicator). Zero on platforms
+ * or devices with no such obstruction. Any output pointer may be null.
+ */
+void AuroraGetSafeAreaInsets(f32* left, f32* top, f32* right, f32* bottom);
+
+/**
  * Sets the actual render viewport in native framebuffer coordinates.
  * Overrides the automatically scaled values set by the logical GXSetViewport.
  */

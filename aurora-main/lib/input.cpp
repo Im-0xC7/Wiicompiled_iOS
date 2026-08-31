@@ -506,8 +506,12 @@ void persist_controller_for_player(uint32_t player, const GameController* contro
 void initialize() noexcept {
   /* Make sure we initialize everything input related now, this will automatically add all of the connected controllers
    * as expected */
-  ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD), "Failed to initialize SDL subsystems: {}",
-         SDL_GetError());
+  // SDL_INIT_SENSOR is required for SDL_GetSensors()/SDL_OpenSensor() to see anything at all -
+  // without it those calls silently report zero sensors rather than failing loudly, which is what
+  // made touch_controls' gyro steering always show sensor=closed on both Simulator and a real
+  // device (neither is actually missing hardware; the subsystem just was never turned on).
+  ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD | SDL_INIT_SENSOR),
+         "Failed to initialize SDL subsystems: {}", SDL_GetError());
 }
 
 struct MouseScrollStatus {
