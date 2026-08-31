@@ -776,6 +776,10 @@ prepare_app_bundle() {
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>GCSupportsGameMode</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
 </dict>
 </plist>
 PLIST
