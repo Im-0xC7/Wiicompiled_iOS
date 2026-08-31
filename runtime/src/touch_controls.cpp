@@ -39,6 +39,9 @@ constexpr float kStickMarginFrac = 0.07f;
 constexpr float kButtonARadiusFrac = 0.075f;
 constexpr float kButtonBRadiusFrac = 0.045f;
 constexpr float kButtonMarginFrac = 0.05f;
+// Vertical-only lift for A alone, off the bottom-right corner slot it'd otherwise share with B
+// (see ButtonClusterAnchor) - B stays put; only A moves up.
+constexpr float kButtonALiftFrac = 0.05f;
 constexpr float kSmallButtonRadiusFrac = 0.035f;
 constexpr float kExpandButtonRadiusFrac = 0.035f;
 constexpr float kExpandMarginFrac = 0.035f;
@@ -97,20 +100,27 @@ ImVec2 StickDefaultCenter(const ScreenMetrics& m) {
 
 float ButtonARadius(const ScreenMetrics& m) { return m.shortSide * kButtonARadiusFrac; }
 float ButtonBRadius(const ScreenMetrics& m) { return m.shortSide * kButtonBRadiusFrac; }
-ImVec2 ButtonACenter(const ScreenMetrics& m) {
+// The un-lifted bottom-right corner slot both buttons used to share. ButtonBCenter is still
+// anchored off this directly (not off ButtonACenter) specifically so raising A alone - see
+// kButtonALiftFrac below - doesn't drag B up with it.
+ImVec2 ButtonClusterAnchor(const ScreenMetrics& m) {
     const float margin = m.shortSide * kButtonMarginFrac;
     const float r = ButtonARadius(m);
     return ImVec2(m.width - m.safeRight - margin - r, m.height - m.safeBottom - margin - r);
 }
-// Down-left of A, like the real GameCube controller's B relative to A - so A ends up at B's
-// top-right, not its bottom-right. The 0.7x vertical factor (rather than the full rA-rB headroom
-// A's extra size leaves below it) keeps B's own bottom edge comfortably inside the same
-// bottom-edge margin ButtonACenter already respects, instead of hugging it exactly.
+ImVec2 ButtonACenter(const ScreenMetrics& m) {
+    const ImVec2 anchor = ButtonClusterAnchor(m);
+    return ImVec2(anchor.x, anchor.y - m.shortSide * kButtonALiftFrac);
+}
+// Down-left of the (un-lifted) anchor, like the real GameCube controller's B relative to A - so A
+// ends up at B's top-right, not its bottom-right. The 0.7x vertical factor (rather than the full
+// rA-rB headroom A's extra size leaves below it) keeps B's own bottom edge comfortably inside the
+// same bottom-edge margin the anchor already respects, instead of hugging it exactly.
 ImVec2 ButtonBCenter(const ScreenMetrics& m) {
-    const ImVec2 a = ButtonACenter(m);
+    const ImVec2 anchor = ButtonClusterAnchor(m);
     const float rA = ButtonARadius(m);
     const float rB = ButtonBRadius(m);
-    return ImVec2(a.x - (rA + rB) * 1.15f, a.y + (rA - rB) * 0.7f);
+    return ImVec2(anchor.x - (rA + rB) * 1.15f, anchor.y + (rA - rB) * 0.7f);
 }
 
 float SmallButtonRadius(const ScreenMetrics& m) { return m.shortSide * kSmallButtonRadiusFrac; }
