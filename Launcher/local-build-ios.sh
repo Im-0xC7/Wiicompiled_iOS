@@ -300,12 +300,18 @@ base_metadata=$generated/base_translation_output.json
 base_manifest_dir=$workspace/build/base
 base_manifest=$base_manifest_dir/mkwii_base_manifest.json
 shards=$generated/build_shards
-# Under --output-dir, not the workspace root, so nothing lands outside the directory the caller
-# asked for. A single tree even for --profile both (which publishes to two directories, --output-dir
-# and --base-output-dir) - CMake builds both targets together, so there is only ever one native
-# build to place. --simulator has no --output-dir at all (nothing gets packaged there), so its
-# build tree falls back to the workspace root, same as before --output-dir existed.
-build=${output_dir:-$workspace}/ios-build-$platform
+# Always under the workspace root, never under --output-dir: --output-dir is caller-supplied and
+# often not the same path across invocations (e.g. a temp/timestamped directory from a wrapper
+# tool, or simply a different --output-dir per run), which would silently move the native build
+# tree to a fresh, cache-less location every time - defeating the configure-fingerprint skip below
+# and forcing a full reconfigure+rebuild on every single invocation regardless of whether anything
+# actually changed. Keeping this at a fixed, workspace-relative path is what makes the tree
+# reusable run to run; --output-dir only controls where the final packaged product lands (see
+# package_built_product below), matching how --simulator's build tree already worked before
+# --output-dir existed. A single tree even for --profile both (which publishes to two directories,
+# --output-dir and --base-output-dir) - CMake builds both targets together, so there is only ever
+# one native build to place.
+build=$workspace/ios-build-$platform
 translation_provenance=$generated/translation-provenance.json
 
 # Must run before anything below extracts into $build (the Retro Rewind zip, the ios-cmake
