@@ -1,15 +1,15 @@
-// Host ISA guard. Every other product target on x86-64 builds with -march=x86-64-v3, so a
-// pre-Haswell Intel or pre-Excavator AMD machine would otherwise die on an illegal-instruction
-// fault with no explanation. This TU alone skips that flag (own CMake object library, excluded
-// from unity build/PCH) and runs from a priority-101 C initializer, ahead of every C++ dynamic
-// initializer and thus the first AVX2 code that could execute. Keep it free of anything that
-// could pull in vectorized code: no iostreams, no std::string, no runtime-wide headers.
+// Host ISA guard. Every other product target builds with -march=x86-64-v3, so a pre-Haswell
+// Intel or pre-Excavator AMD machine would otherwise die on an illegal-instruction fault with no
+// explanation. This TU alone skips that flag (own CMake object library, excluded from unity
+// build/PCH) and runs from a priority-101 C initializer, ahead of every C++ dynamic initializer
+// and thus the first AVX2 code that could execute. Keep it free of anything that could pull in
+// vectorized code: no iostreams, no std::string, no runtime-wide headers.
 //
-// On arm64 (Apple Silicon) there is no equivalent tuning policy: every M-series/A-series chip
-// this project targets is a single fixed ISA baseline, PublicProducts.cmake applies no
-// -march=x86-64-v3-equivalent flag there (see MKW_ARCH_TUNING_FLAGS), and <cpuid.h>/xgetbv are
-// x86-only and do not exist on that target. MkwHostCpuBaselineInit() is a no-op there instead of
-// a feature probe.
+// x86-64-v3 is an x86-specific optional-feature baseline (AVX2/BMI2/FMA and friends are not
+// guaranteed present on every x86_64 chip); nothing here applies on AArch64 (Apple Silicon or
+// otherwise), where ASIMD/NEON is mandatory in the base architecture and PublicProducts.cmake
+// never applies an -march=x86-64-v3 equivalent flag to begin with. That branch below is a no-op
+// stub, not a port of this check.
 
 #include <cstdint>
 #include <cstdio>
@@ -218,8 +218,8 @@ extern "C" int MkwHostCpuBaselineInit() {
 #else  // !(__x86_64__ || _M_X64)
 
 // No ISA baseline to probe: every arm64 target this project builds for (Apple Silicon
-// macOS/iOS) is a single fixed instruction set, so there is nothing here that could fail the
-// way a pre-Haswell/pre-Excavator x86-64 host could.
+// macOS/iOS, or native/cross AArch64 Linux) is a single fixed instruction set, so there is
+// nothing here that could fail the way a pre-Haswell/pre-Excavator x86-64 host could.
 extern "C" int MkwHostCpuBaselineInit() {
     return 0;
 }

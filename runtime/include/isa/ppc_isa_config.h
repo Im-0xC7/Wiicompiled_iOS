@@ -8,6 +8,8 @@
 #include <immintrin.h>
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
+#else
+#error "ppc_isa_config.h has no SIMD intrinsics header for this architecture"
 #endif
 
 inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
