@@ -194,7 +194,7 @@ constexpr int kRollAxisA = 0;
 constexpr int kRollAxisB = 1;
 constexpr float kRollSign = -1.0f;
 constexpr float kGyroDeadzoneRadians = 0.05f;
-constexpr float kGyroMaxAngleRadians = 0.6f; // ~34 degrees of tilt for full steering deflection
+constexpr float kGyroMaxAngleRadians = 0.45f; // ~26 degrees of tilt for full steering deflection
 constexpr float kGyroSmoothing = 0.25f;      // exponential smoothing factor, higher = snappier
 
 struct GyroState {
