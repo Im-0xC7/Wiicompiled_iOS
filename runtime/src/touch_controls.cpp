@@ -26,7 +26,12 @@ namespace {
 // phone/tablet sizes and either orientation, matching how e.g. DrawFpsOverlay's kMargin constants
 // are fixed pixels but this HUD's touch targets need to stay a consistent *finger-relative* size.
 constexpr float kStickVisualRadiusFrac = 0.10f;
-constexpr float kStickActivationRadiusFrac = 0.16f; // larger than the visual ring - forgiving hit target
+// Well past the visual ring - covers "roughly the bottom-left corner" rather than just the ring
+// itself, so a tap that lands to the side of it (thumb not lined up exactly, held one-handed,
+// etc.) still claims the stick instead of silently missing. Once claimed, the stick's origin
+// snaps to wherever the finger actually landed (see the finger-down handler below), so this only
+// widens the catch area - it never changes where the stick visually appears.
+constexpr float kStickActivationRadiusFrac = 0.32f;
 constexpr float kStickDragRangeFrac = 0.14f;         // drag distance for full deflection
 constexpr float kStickMarginFrac = 0.07f;
 constexpr float kButtonRadiusFrac = 0.06f;
