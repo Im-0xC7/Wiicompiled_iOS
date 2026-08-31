@@ -34,7 +34,10 @@ constexpr float kStickVisualRadiusFrac = 0.10f;
 constexpr float kStickActivationRadiusFrac = 0.32f;
 constexpr float kStickDragRangeFrac = 0.14f;         // drag distance for full deflection
 constexpr float kStickMarginFrac = 0.07f;
-constexpr float kButtonRadiusFrac = 0.06f;
+// GameCube-inspired sizing: A (accelerate) bigger and B (brake/item) smaller than the old shared
+// size, matching the real controller's size difference between the two.
+constexpr float kButtonARadiusFrac = 0.075f;
+constexpr float kButtonBRadiusFrac = 0.045f;
 constexpr float kButtonMarginFrac = 0.05f;
 constexpr float kSmallButtonRadiusFrac = 0.035f;
 constexpr float kExpandButtonRadiusFrac = 0.035f;
@@ -92,16 +95,22 @@ ImVec2 StickDefaultCenter(const ScreenMetrics& m) {
     return ImVec2(m.safeLeft + margin + r, m.height - m.safeBottom - margin - r);
 }
 
-float ButtonRadius(const ScreenMetrics& m) { return m.shortSide * kButtonRadiusFrac; }
+float ButtonARadius(const ScreenMetrics& m) { return m.shortSide * kButtonARadiusFrac; }
+float ButtonBRadius(const ScreenMetrics& m) { return m.shortSide * kButtonBRadiusFrac; }
 ImVec2 ButtonACenter(const ScreenMetrics& m) {
     const float margin = m.shortSide * kButtonMarginFrac;
-    const float r = ButtonRadius(m);
+    const float r = ButtonARadius(m);
     return ImVec2(m.width - m.safeRight - margin - r, m.height - m.safeBottom - margin - r);
 }
+// Down-left of A, like the real GameCube controller's B relative to A - so A ends up at B's
+// top-right, not its bottom-right. The 0.7x vertical factor (rather than the full rA-rB headroom
+// A's extra size leaves below it) keeps B's own bottom edge comfortably inside the same
+// bottom-edge margin ButtonACenter already respects, instead of hugging it exactly.
 ImVec2 ButtonBCenter(const ScreenMetrics& m) {
     const ImVec2 a = ButtonACenter(m);
-    const float r = ButtonRadius(m);
-    return ImVec2(a.x - r * 2.1f, a.y - r * 1.5f);
+    const float rA = ButtonARadius(m);
+    const float rB = ButtonBRadius(m);
+    return ImVec2(a.x - (rA + rB) * 1.15f, a.y + (rA - rB) * 0.7f);
 }
 
 float SmallButtonRadius(const ScreenMetrics& m) { return m.shortSide * kSmallButtonRadiusFrac; }
@@ -164,8 +173,8 @@ ImVec2 PanelRightCenter(const ScreenMetrics& m) {
 }
 
 StickState g_stick;
-TouchZone g_buttonA{ButtonACenter, ButtonRadius, std::nullopt};
-TouchZone g_buttonB{ButtonBCenter, ButtonRadius, std::nullopt};
+TouchZone g_buttonA{ButtonACenter, ButtonARadius, std::nullopt};
+TouchZone g_buttonB{ButtonBCenter, ButtonBRadius, std::nullopt};
 TouchZone g_expandButton{ExpandButtonCenter, SmallButtonRadius, std::nullopt};
 // Every zone needs a real center/radius function pointer - a default-constructed TouchZone would
 // zero-initialize these to null and crash the first time it's hit-tested or drawn.
@@ -194,7 +203,7 @@ constexpr int kRollAxisA = 0;
 constexpr int kRollAxisB = 1;
 constexpr float kRollSign = -1.0f;
 constexpr float kGyroDeadzoneRadians = 0.05f;
-constexpr float kGyroMaxAngleRadians = 0.45f; // ~26 degrees of tilt for full steering deflection
+constexpr float kGyroMaxAngleRadians = 0.5236f; // ~30 degrees of tilt for full steering deflection
 constexpr float kGyroSmoothing = 0.25f;      // exponential smoothing factor, higher = snappier
 
 struct GyroState {
