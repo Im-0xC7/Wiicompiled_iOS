@@ -124,6 +124,28 @@ ImVec2 ButtonBCenter(const ScreenMetrics& m) {
     return ImVec2(anchor.x - (rA + rB) * 1.15f, anchor.y + (rA - rB) * 0.7f);
 }
 
+// Gyro mode only (see g_buttonL/g_buttonR below): mirrors the A/B cluster onto the left side of
+// the screen, since gyro steering hides the stick and frees up that space for L/R instead. Both
+// use A's (larger) radius rather than mirroring B's smaller one - per request, the pair reads as
+// one matched set rather than a small/large split like A/B.
+ImVec2 ButtonClusterAnchorLeft(const ScreenMetrics& m) {
+    const float margin = m.shortSide * kButtonMarginFrac;
+    const float r = ButtonARadius(m);
+    return ImVec2(m.safeLeft + margin + r, m.height - m.safeBottom - margin - r);
+}
+ImVec2 GyroButtonLCenter(const ScreenMetrics& m) {
+    const ImVec2 anchor = ButtonClusterAnchorLeft(m);
+    return ImVec2(anchor.x, anchor.y - m.shortSide * kButtonALiftFrac);
+}
+// Mirrors ButtonBCenter's inward-and-down offset from the anchor - inward now points right
+// (toward screen center) instead of left, and the vertical term drops out entirely since L and R
+// share a radius (ButtonBCenter's rA-rB term, which lifts B less than A, becomes 0 here).
+ImVec2 GyroButtonRCenter(const ScreenMetrics& m) {
+    const ImVec2 anchor = ButtonClusterAnchorLeft(m);
+    const float r = ButtonARadius(m);
+    return ImVec2(anchor.x + (r + r) * 1.15f, anchor.y);
+}
+
 float SmallButtonRadius(const ScreenMetrics& m) { return m.shortSide * kSmallButtonRadiusFrac; }
 ImVec2 ExpandButtonCenter(const ScreenMetrics& m) {
     const float margin = m.shortSide * kExpandMarginFrac;
@@ -186,6 +208,11 @@ ImVec2 PanelRightCenter(const ScreenMetrics& m) {
 StickState g_stick;
 TouchZone g_buttonA{ButtonACenter, ButtonARadius, std::nullopt};
 TouchZone g_buttonB{ButtonBCenter, ButtonBRadius, std::nullopt};
+// Gyro mode only - claimable/drawn only while g_gyro.enabled (see HandleSdlEvent/Draw), mirroring
+// A/B onto the left side of the screen. Kept as top-level zones (not part of the panel) since,
+// unlike the D-pad/Start, L/R are meant to be primary controls the instant gyro mode turns on.
+TouchZone g_buttonL{GyroButtonLCenter, ButtonARadius, std::nullopt};
+TouchZone g_buttonR{GyroButtonRCenter, ButtonARadius, std::nullopt};
 TouchZone g_expandButton{ExpandButtonCenter, SmallButtonRadius, std::nullopt};
 // Every zone needs a real center/radius function pointer - a default-constructed TouchZone would
 // zero-initialize these to null and crash the first time it's hit-tested or drawn.
@@ -267,10 +294,8 @@ struct GyroState {
 
 GyroState g_gyro;
 
-// TEMPORARY debug aid (requested to diagnose "buttons aren't showing up") - remove once touch
-// controls are confirmed working end-to-end on a real device. Snapshot of the last values
-// ApplyOverlay() actually injected into port 0, so the overlay can show what gameplay is really
-// seeing rather than just what the HUD drew.
+// Snapshot of the last values ApplyOverlay() actually injected into port 0, so the debug overlay
+// can show what gameplay is really seeing rather than just what the HUD drew.
 struct DebugOverlaySnapshot {
     bool active = false;
     uint16_t buttons = 0;
@@ -468,8 +493,14 @@ bool WantsTouchControls() {
 #endif
 }
 
-// TEMPORARY debug aid - see DebugOverlaySnapshot above. Always visible regardless of
-// WantsTouchControls()/gyro state so it stays useful precisely when those are misbehaving.
+// Flip to true to bring the debug overlay back - left in place rather than deleted since it's
+// been repeatedly useful for diagnosing touch/gyro/flick issues that aren't reproducible without a
+// real device in hand.
+constexpr bool kShowDebugOverlay = false;
+
+// Debug aid - see DebugOverlaySnapshot above. Always visible (when kShowDebugOverlay is on)
+// regardless of WantsTouchControls()/gyro state so it stays useful precisely when those are
+// misbehaving.
 void DrawDebugOverlay() {
     const ScreenMetrics m = CurrentMetrics();
     uint32_t nativeW = 0, nativeH = 0;
@@ -523,6 +554,10 @@ void DrawDebugOverlay() {
         zoneLine("stick", g_stick.finger);
         zoneLine("A", g_buttonA.finger);
         zoneLine("B", g_buttonB.finger);
+        if (g_gyro.enabled) {
+            zoneLine("L (gyro)", g_buttonL.finger);
+            zoneLine("R (gyro)", g_buttonR.finger);
+        }
         zoneLine("expand", g_expandButton.finger);
         if (g_panelExpanded) {
             zoneLine("panel up", g_panelUp.finger);
@@ -530,8 +565,10 @@ void DrawDebugOverlay() {
             zoneLine("panel left", g_panelLeft.finger);
             zoneLine("panel right", g_panelRight.finger);
             zoneLine("panel start", g_panelStart.finger);
-            zoneLine("panel L", g_panelL.finger);
-            zoneLine("panel R", g_panelR.finger);
+            if (!g_gyro.enabled) {
+                zoneLine("panel L", g_panelL.finger);
+                zoneLine("panel R", g_panelR.finger);
+            }
             zoneLine("panel gyro", g_panelGyro.finger);
         }
 
@@ -596,6 +633,11 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
 
         HandlePressZone(g_buttonA, finger, m, event.type);
         HandlePressZone(g_buttonB, finger, m, event.type);
+        // Only claimable while gyro mode has actually moved L/R here (see g_buttonL/g_buttonR
+        // above) - release still always processes via HandlePressZone's own logic, so a finger
+        // that claimed one right as gyro mode turned off doesn't stay stuck pressed.
+        HandlePressZone(g_buttonL, finger, m, event.type, g_gyro.enabled);
+        HandlePressZone(g_buttonR, finger, m, event.type, g_gyro.enabled);
         HandlePressZone(g_expandButton, finger, m, event.type);
         if (event.type == SDL_EVENT_FINGER_DOWN && g_expandButton.finger == finger.fingerID) {
             g_panelExpanded = !g_panelExpanded;
@@ -605,8 +647,10 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
         HandlePressZone(g_panelLeft, finger, m, event.type, g_panelExpanded);
         HandlePressZone(g_panelRight, finger, m, event.type, g_panelExpanded);
         HandlePressZone(g_panelStart, finger, m, event.type, g_panelExpanded);
-        HandlePressZone(g_panelL, finger, m, event.type, g_panelExpanded);
-        HandlePressZone(g_panelR, finger, m, event.type, g_panelExpanded);
+        // Not claimable while gyro mode is on - L/R live at g_buttonL/g_buttonR (above) instead,
+        // so the panel's smaller copies don't double up on the same input.
+        HandlePressZone(g_panelL, finger, m, event.type, g_panelExpanded && !g_gyro.enabled);
+        HandlePressZone(g_panelR, finger, m, event.type, g_panelExpanded && !g_gyro.enabled);
         HandlePressZone(g_panelGyro, finger, m, event.type, g_panelExpanded);
         if (event.type == SDL_EVENT_FINGER_DOWN && g_panelGyro.finger == finger.fingerID) {
             SetGyroSteeringEnabled(!g_gyro.enabled);
@@ -634,7 +678,9 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
 }
 
 void Draw() noexcept {
-    DrawDebugOverlay(); // TEMPORARY - see DebugOverlaySnapshot above.
+    if (kShowDebugOverlay) {
+        DrawDebugOverlay();
+    }
     // Keep the panel (and its Gyro toggle) reachable even if touch controls are otherwise off,
     // so enabling gyro can never strand the player with no way back to the toggle that turns it
     // back off.
@@ -695,6 +741,10 @@ void Draw() noexcept {
 
     drawButton(g_buttonA, "A");
     drawButton(g_buttonB, "B");
+    if (g_gyro.enabled) {
+        drawButton(g_buttonL, "L");
+        drawButton(g_buttonR, "R");
+    }
     drawButton(g_expandButton, g_panelExpanded ? "x" : "...");
 
     if (g_panelExpanded) {
@@ -703,8 +753,11 @@ void Draw() noexcept {
         drawButton(g_panelLeft, "<");
         drawButton(g_panelRight, ">");
         drawButton(g_panelStart, "St");
-        drawButton(g_panelL, "L");
-        drawButton(g_panelR, "R");
+        // L/R live at g_buttonL/g_buttonR instead while gyro mode is on - see above.
+        if (!g_gyro.enabled) {
+            drawButton(g_panelL, "L");
+            drawButton(g_panelR, "R");
+        }
 
         // Reflects the persistent on/off toggle state, not "currently held" like the buttons
         // above - so unlike drawButton() this colors active off g_gyro.enabled, not zone.finger.
@@ -736,6 +789,11 @@ void ApplyOverlay(PADStatus* statuses, uint32_t count) noexcept {
     uint16_t buttons = status.button;
     if (g_buttonA.finger) buttons |= PAD_BUTTON_A;
     if (g_buttonB.finger) buttons |= PAD_BUTTON_B;
+    // Only ever claimable while gyro mode is on (see HandleSdlEvent), so no separate gyroActive
+    // check is needed here - matches how g_buttonA/g_buttonB above don't gate on WantsTouchControls
+    // either, since a zone's finger can only be set when it was actually claimable.
+    if (g_buttonL.finger) buttons |= PAD_TRIGGER_L;
+    if (g_buttonR.finger) buttons |= PAD_TRIGGER_R;
     if (g_panelExpanded) {
         if (g_panelUp.finger) buttons |= PAD_BUTTON_UP;
         if (g_panelDown.finger) buttons |= PAD_BUTTON_DOWN;
