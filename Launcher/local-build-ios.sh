@@ -121,7 +121,7 @@ retro_rewind_zip=""
 retro_rewind_dir=""
 retro_wfc_offline_dir=""
 skip_retro_wfc_payload=0
-deployment_target=16.0
+deployment_target=14.0
 bundle_id="dev.wiicompiled.game"
 bundle_name="WiiCompiled"
 bundle_version="1"
@@ -164,9 +164,11 @@ Usage: local-build-ios.sh --output-dir DIR [options]
   --skip-retro-wfc-payload     Build Retro Rewind without a Retro-WFC payload
                                 (exactly one of the two Retro-WFC options above is required for a
                                 Retro Rewind build)
-  --deployment-target VERSION  Minimum iOS version (default: 16.0 - Dawn's std::atomic::wait
-                                usage needs iOS Simulator 14.0+; 16.0 leaves headroom with no real
-                                downside since sideloading a much older device is uncommon)
+  --deployment-target VERSION  Minimum iOS version (default: 14.0 - Dawn's std::atomic::wait usage
+                                needs iOS Simulator 14.0+, which is this script's real floor; no
+                                other code in this codebase is version-gated. Confirmed booting on
+                                a real device at 14.8; untested below that within the 14.x/15.x
+                                range)
   --bundle-id ID                 CFBundleIdentifier (default: dev.wiicompiled.game). A Retro
                                 Rewind build always gets ID.retro so both can install at once.
   --bundle-name NAME             CFBundleName/CFBundleDisplayName, the home-screen icon label
