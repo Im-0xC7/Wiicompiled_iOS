@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_sensor.h>
+#include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_touch.h>
 
 #include <dolphin/gx/GXAurora.h>
@@ -216,12 +217,46 @@ constexpr float kGyroDeadzoneRadians = 0.05f;
 constexpr float kGyroMaxAngleRadians = 0.5236f; // ~30 degrees of tilt for full steering deflection
 constexpr float kGyroSmoothing = 0.25f;      // exponential smoothing factor, higher = snappier
 
+// Trick/stunt flicks (gyro mode only): mirrors the Wii Remote's motion-based trick input, which
+// MKW binds to the GameCube pad's D-pad. Reuses the same accelerometer feed opened for tilt
+// steering above - no second sensor. A "flick" is a short, sharp *linear* acceleration spike;
+// isolated from the steady tilt/gravity reading by subtracting a slow-moving per-axis baseline
+// (kFlickBaselineSmoothing) from the raw sample, so the transient shows up on top of whatever
+// steering angle is currently held rather than requiring the phone to be level.
+//
+// Axis choice: kFlickHorizontalAxis reuses kRollAxisA (the same axis RollAngle reads for
+// left/right tilt) - a quick side-to-side shove of the phone shows up there too, just as a
+// transient riding on top of the held tilt rather than a change to it. kFlickVerticalAxis is the
+// one axis RollAngle never reads (index 2), which by elimination is the one that responds to
+// raising/lowering the phone. As with kRollSign above, the *Sign constants below are a best guess
+// pending real-device verification - flip whichever direction reads backwards, exactly like
+// kRollSign needed to be flipped once actual hardware testing showed steering was reversed.
+enum class FlickDirection { None, Up, Down, Left, Right };
+
+constexpr int kFlickHorizontalAxis = kRollAxisA;
+constexpr int kFlickVerticalAxis = 2;
+constexpr float kFlickHorizontalSign = 1.0f;
+constexpr float kFlickVerticalSign = 1.0f;
+constexpr float kFlickBaselineSmoothing = 0.02f;  // slow EMA of "how the phone is currently held"
+constexpr float kFlickTriggerThreshold = 7.0f;    // m/s^2 of jerk needed to fire a direction
+constexpr float kFlickResetThreshold = 3.0f;      // must decay back below this before re-arming
+constexpr Uint64 kFlickHoldMs = 120;              // how long the synthesized D-pad press stays down
+
 struct GyroState {
     bool enabled = false;
     SDL_Sensor* sensor = nullptr;
     bool hasNeutral = false;
     float neutralAngle = 0.0f;
     float smoothedAngle = 0.0f;
+
+    // Flick/trick detection state - see the constants above.
+    bool hasFlickBaseline = false;
+    float flickBaseline[3] = {0.0f, 0.0f, 0.0f};
+    bool flickArmed = true;
+    FlickDirection activeFlick = FlickDirection::None;
+    Uint64 flickStartMs = 0;
+    float lastJerkH = 0.0f;  // debug overlay only
+    float lastJerkV = 0.0f;  // debug overlay only
 };
 
 GyroState g_gyro;
@@ -242,12 +277,79 @@ float RollAngle(const float data[3]) {
     return kRollSign * std::atan2(data[kRollAxisA], data[kRollAxisB]);
 }
 
+const char* FlickDirectionName(FlickDirection direction) {
+    switch (direction) {
+    case FlickDirection::Up: return "up";
+    case FlickDirection::Down: return "down";
+    case FlickDirection::Left: return "left";
+    case FlickDirection::Right: return "right";
+    default: return "-";
+    }
+}
+
+void ResetFlickState() {
+    g_gyro.hasFlickBaseline = false;
+    g_gyro.flickArmed = true;
+    g_gyro.activeFlick = FlickDirection::None;
+    g_gyro.flickStartMs = 0;
+}
+
+// Called once per accelerometer sample while gyro mode is on. Maintains a slow per-axis baseline
+// (kFlickBaselineSmoothing) and fires at most one direction per physical flick, gated by a
+// trigger/reset hysteresis band (see the constants above) so a single motion can't fire twice as
+// it swings out and back.
+void UpdateFlickDetection(const float data[3]) {
+    if (!g_gyro.hasFlickBaseline) {
+        g_gyro.flickBaseline[0] = data[0];
+        g_gyro.flickBaseline[1] = data[1];
+        g_gyro.flickBaseline[2] = data[2];
+        g_gyro.hasFlickBaseline = true;
+        return;
+    }
+
+    const float jerkH = (data[kFlickHorizontalAxis] - g_gyro.flickBaseline[kFlickHorizontalAxis]) * kFlickHorizontalSign;
+    const float jerkV = (data[kFlickVerticalAxis] - g_gyro.flickBaseline[kFlickVerticalAxis]) * kFlickVerticalSign;
+    g_gyro.lastJerkH = jerkH;
+    g_gyro.lastJerkV = jerkV;
+
+    // Baseline update happens after reading the jerk, and unconditionally (even mid-flick) - it's
+    // slow enough that a single flick's duration barely moves it, but it still needs to track slow
+    // drift in how the phone is held between flicks.
+    for (int axis = 0; axis < 3; ++axis) {
+        g_gyro.flickBaseline[axis] += (data[axis] - g_gyro.flickBaseline[axis]) * kFlickBaselineSmoothing;
+    }
+
+    const float magH = std::fabs(jerkH);
+    const float magV = std::fabs(jerkV);
+    const float peak = std::max(magH, magV);
+
+    if (!g_gyro.flickArmed) {
+        // A flick's return-to-neutral swing can be nearly as sharp as the flick itself; without
+        // this hysteresis a single physical motion would fire twice, once each direction.
+        if (peak < kFlickResetThreshold) {
+            g_gyro.flickArmed = true;
+        }
+        return;
+    }
+
+    if (peak < kFlickTriggerThreshold) {
+        return;
+    }
+
+    g_gyro.activeFlick = (magH >= magV)
+        ? (jerkH > 0.0f ? FlickDirection::Right : FlickDirection::Left)
+        : (jerkV > 0.0f ? FlickDirection::Up : FlickDirection::Down);
+    g_gyro.flickStartMs = SDL_GetTicks();
+    g_gyro.flickArmed = false;
+}
+
 void CloseGyroSensor() {
     if (g_gyro.sensor) {
         SDL_CloseSensor(g_gyro.sensor);
         g_gyro.sensor = nullptr;
     }
     g_gyro.hasNeutral = false;
+    ResetFlickState();
 }
 
 void OpenGyroSensor() {
@@ -420,6 +522,9 @@ void DrawDebugOverlay() {
         ImGui::Text("Gyro: enabled=%s sensor=%s neutral=%s angle=%.3f",
                      g_gyro.enabled ? "yes" : "no", g_gyro.sensor ? "open" : "closed",
                      g_gyro.hasNeutral ? "yes" : "no", static_cast<double>(g_gyro.smoothedAngle));
+        ImGui::Text("Flick: dir=%s armed=%s jerkH=%.2f jerkV=%.2f",
+                     FlickDirectionName(g_gyro.activeFlick), g_gyro.flickArmed ? "yes" : "no",
+                     static_cast<double>(g_gyro.lastJerkH), static_cast<double>(g_gyro.lastJerkV));
 
         ImGui::Separator();
         ImGui::Text("Applied to PAD port 0: active=%s buttons=0x%04X stick=(%d, %d)",
@@ -500,6 +605,7 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
             } else {
                 g_gyro.smoothedAngle += (angle - g_gyro.smoothedAngle) * kGyroSmoothing;
             }
+            UpdateFlickDetection(event.sensor.data);
         }
         break;
     }
@@ -619,6 +725,22 @@ void ApplyOverlay(PADStatus* statuses, uint32_t count) noexcept {
         if (g_panelStart.finger) buttons |= PAD_BUTTON_START;
         if (g_panelL.finger) buttons |= PAD_TRIGGER_L;
         if (g_panelR.finger) buttons |= PAD_TRIGGER_R;
+    }
+    // Flick-to-D-pad: only meaningful while gyro steering is actually driving the stick (matches
+    // where the trick input comes from on a real Wii Remote); expires on its own after
+    // kFlickHoldMs so ApplyOverlay doesn't need a separate "and now release it" call site.
+    if (gyroActive && g_gyro.activeFlick != FlickDirection::None) {
+        if (SDL_GetTicks() - g_gyro.flickStartMs < kFlickHoldMs) {
+            switch (g_gyro.activeFlick) {
+            case FlickDirection::Up: buttons |= PAD_BUTTON_UP; break;
+            case FlickDirection::Down: buttons |= PAD_BUTTON_DOWN; break;
+            case FlickDirection::Left: buttons |= PAD_BUTTON_LEFT; break;
+            case FlickDirection::Right: buttons |= PAD_BUTTON_RIGHT; break;
+            default: break;
+            }
+        } else {
+            g_gyro.activeFlick = FlickDirection::None;
+        }
     }
     status.button = buttons;
 
