@@ -12,4 +12,11 @@ void Draw() noexcept;
 bool StartupScreenVisible() noexcept;
 void NotifyStrapInputAccepted() noexcept;
 void AdvancePresentedFrame() noexcept;
+
+// Touch-button entry points for touch_controls.cpp's resolution-scale button - forward into the
+// same SetResolutionScale the desktop top-bar's Resolution menu uses (defined in the anonymous
+// namespace inside settings_overlay.cpp, so not directly callable from another translation unit),
+// keeping both paths in sync through one VISetFrameBufferScale/Config.toml write.
+void CycleResolutionScale() noexcept;
+float CurrentResolutionScale() noexcept;
 } // namespace settings_overlay

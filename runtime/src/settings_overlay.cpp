@@ -936,4 +936,23 @@ void NotifyStrapInputAccepted() noexcept {
 }
 
 void AdvancePresentedFrame() noexcept { ++g_presentedFrame; }
+
+// Steps through a short {1x, 2x, 4x} cycle rather than the desktop menu's full preset list (which
+// also includes Auto/1.5x/3x/6x/8x) - a quick touch tap should reach a meaningfully higher
+// resolution within a couple of presses, not require stepping through every preset. If the current
+// scale isn't one of these three (e.g. set to 1.5x from the desktop menu), resets to the first step
+// rather than searching for a "nearest" one, so the button's behavior stays simple to predict.
+void CycleResolutionScale() noexcept {
+    constexpr std::array<float, 3> kTouchResolutionCycle = {1.0f, 2.0f, 4.0f};
+    size_t next = 0;
+    for (size_t i = 0; i < kTouchResolutionCycle.size(); ++i) {
+        if (std::fabs(kTouchResolutionCycle[i] - g_resolutionScale) < 0.001f) {
+            next = (i + 1) % kTouchResolutionCycle.size();
+            break;
+        }
+    }
+    SetResolutionScale(kTouchResolutionCycle[next]);
+}
+
+float CurrentResolutionScale() noexcept { return g_resolutionScale; }
 } // namespace settings_overlay

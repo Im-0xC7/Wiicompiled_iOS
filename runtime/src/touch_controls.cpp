@@ -1,5 +1,6 @@
 #include "touch_controls.h"
 #include "runtime_config.h"
+#include "settings_overlay.h"
 
 #include <imgui.h>
 #include <SDL3/SDL_events.h>
@@ -14,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 
 #if defined(__APPLE__)
@@ -152,6 +154,14 @@ ImVec2 ExpandButtonCenter(const ScreenMetrics& m) {
     const float r = m.shortSide * kExpandButtonRadiusFrac;
     return ImVec2(m.width - m.safeRight - margin - r, m.safeTop + margin + r);
 }
+// Always visible (not tucked in the collapsible panel like L/R/D-pad/Start) - resolution is a
+// quick, frequent toggle rather than a rarely-needed menu action, so it sits right next to the
+// expand button instead of a tap behind it. Same spacing multiplier PanelLCenter/PanelRCenter use
+// between their own neighbors, for a consistent visual rhythm across the two rows of small buttons.
+ImVec2 ResolutionButtonCenter(const ScreenMetrics& m) {
+    const ImVec2 e = ExpandButtonCenter(m);
+    return ImVec2(e.x - SmallButtonRadius(m) * 2.6f, e.y);
+}
 // Secondary panel (D-pad/Start/L/R), only meaningful while expanded - a horizontal cluster below
 // the expand button so it never overlaps the primary race controls.
 ImVec2 PanelDPadCenter(const ScreenMetrics& m) {
@@ -214,6 +224,7 @@ TouchZone g_buttonB{ButtonBCenter, ButtonBRadius, std::nullopt};
 TouchZone g_buttonL{GyroButtonLCenter, ButtonARadius, std::nullopt};
 TouchZone g_buttonR{GyroButtonRCenter, ButtonARadius, std::nullopt};
 TouchZone g_expandButton{ExpandButtonCenter, SmallButtonRadius, std::nullopt};
+TouchZone g_resolutionButton{ResolutionButtonCenter, SmallButtonRadius, std::nullopt};
 // Every zone needs a real center/radius function pointer - a default-constructed TouchZone would
 // zero-initialize these to null and crash the first time it's hit-tested or drawn.
 TouchZone g_panelUp{PanelUpCenter, SmallButtonRadius, std::nullopt};
@@ -559,6 +570,7 @@ void DrawDebugOverlay() {
             zoneLine("R (gyro)", g_buttonR.finger);
         }
         zoneLine("expand", g_expandButton.finger);
+        zoneLine("resolution", g_resolutionButton.finger);
         if (g_panelExpanded) {
             zoneLine("panel up", g_panelUp.finger);
             zoneLine("panel down", g_panelDown.finger);
@@ -641,6 +653,10 @@ void HandleSdlEvent(const SDL_Event& event) noexcept {
         HandlePressZone(g_expandButton, finger, m, event.type);
         if (event.type == SDL_EVENT_FINGER_DOWN && g_expandButton.finger == finger.fingerID) {
             g_panelExpanded = !g_panelExpanded;
+        }
+        HandlePressZone(g_resolutionButton, finger, m, event.type);
+        if (event.type == SDL_EVENT_FINGER_DOWN && g_resolutionButton.finger == finger.fingerID) {
+            settings_overlay::CycleResolutionScale();
         }
         HandlePressZone(g_panelUp, finger, m, event.type, g_panelExpanded);
         HandlePressZone(g_panelDown, finger, m, event.type, g_panelExpanded);
@@ -746,6 +762,10 @@ void Draw() noexcept {
         drawButton(g_buttonR, "R");
     }
     drawButton(g_expandButton, g_panelExpanded ? "x" : "...");
+    char resolutionLabel[8];
+    std::snprintf(resolutionLabel, sizeof(resolutionLabel), "%gx",
+                   static_cast<double>(settings_overlay::CurrentResolutionScale()));
+    drawButton(g_resolutionButton, resolutionLabel);
 
     if (g_panelExpanded) {
         drawButton(g_panelUp, "^");
