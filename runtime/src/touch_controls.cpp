@@ -752,7 +752,7 @@ void Draw() noexcept {
         drawButton(g_panelDown, "v");
         drawButton(g_panelLeft, "<");
         drawButton(g_panelRight, ">");
-        drawButton(g_panelStart, "St");
+        drawButton(g_panelStart, "+");
         // L/R live at g_buttonL/g_buttonR instead while gyro mode is on - see above.
         if (!g_gyro.enabled) {
             drawButton(g_panelL, "L");
