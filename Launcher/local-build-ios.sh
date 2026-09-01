@@ -127,6 +127,7 @@ bundle_name="WiiCompiled"
 bundle_version="1"
 bundle_short_version="1.0"
 ios_toolchain_override=""
+skip_ipa_packaging=0
 force_clean_build=0
 parallel_override=0
 cmake_override=""
@@ -177,6 +178,10 @@ Usage: local-build-ios.sh --output-dir DIR [options]
   --bundle-short-version VER    CFBundleShortVersionString, a user-facing version (default: 1.0)
   --ios-toolchain PATH          ios-cmake's ios.toolchain.cmake (default: WORKSPACE/ios.toolchain.cmake
                                 if present, otherwise downloaded once into the build directory)
+  --skip-ipa                    Skip zipping the built product into a .ipa; instead copy the plain
+                                .app bundle straight into --output-dir (--base-output-dir too, with
+                                --profile both). Not valid with --simulator, which never packages
+                                an .ipa to begin with.
   --force-clean-build           Discard every translation/build cache first
   --parallel N                  Pin translator threads, translated-shard job pool, and Ninja parallelism to N
   --cmake PATH / --ninja PATH   Build tools (default: on PATH)
@@ -204,6 +209,7 @@ while [[ $# -gt 0 ]]; do
         --bundle-version) bundle_version=$2; shift 2 ;;
         --bundle-short-version) bundle_short_version=$2; shift 2 ;;
         --ios-toolchain) ios_toolchain_override=$2; shift 2 ;;
+        --skip-ipa) skip_ipa_packaging=1; shift ;;
         --force-clean-build) force_clean_build=1; shift ;;
         --parallel) parallel_override=$2; shift 2 ;;
         --cmake) cmake_override=$2; shift 2 ;;
@@ -230,6 +236,7 @@ if (( run_simulator )); then
     if [[ -n "$output_dir" || -n "$base_output_dir" ]]; then
         fail "--output-dir/--base-output-dir are not used with --simulator; the built app launches directly instead of being packaged."
     fi
+    (( skip_ipa_packaging )) && fail "--skip-ipa is not used with --simulator; that mode never packages an .ipa to begin with."
 else
     [[ -n "$output_dir" ]] || { usage; fail "--output-dir is required"; }
 fi
@@ -806,17 +813,33 @@ package_built_product() {
     prepare_app_bundle "$target" "$provenance_profile"
     local app_bundle=$build/$target.app
     resolve_target_identity "$provenance_profile"
-
-    log_step "package-ipa-$target" "Packaging $target as an unsigned .ipa"
-    local payload_dir=$build/Payload
-    rm -rf "$payload_dir"
-    mkdir -p "$payload_dir"
-    cp -R "$app_bundle" "$payload_dir/"
     mkdir -p "$destination"
-    local ipa_path=$destination/$target.ipa
-    rm -f "$ipa_path"
-    (cd "$build" && zip -r -X -y "$ipa_path" "Payload") >/dev/null
-    rm -rf "$payload_dir"
+
+    local product_path
+    if (( skip_ipa_packaging )); then
+        # --skip-ipa: not every install path needs a .ipa specifically - some sideloading
+        # tools/local Xcode device installs take a plain .app bundle directly, so zipping one into
+        # Payload/*.ipa just to have the caller unzip it again is wasted work on that path. rsync
+        # (not cp -R) so re-running over a stale .app already at $destination from a previous
+        # build doesn't leave orphaned files behind, matching why prepare_app_bundle's own DATA/
+        # bundling above uses --delete.
+        log_step "package-app-$target" "Copying $target.app into $destination (skipping .ipa packaging)"
+        local dest_app=$destination/$target.app
+        rm -rf "$dest_app"
+        rsync -a --delete "$app_bundle/" "$dest_app/"
+        product_path=$dest_app
+    else
+        log_step "package-ipa-$target" "Packaging $target as an unsigned .ipa"
+        local payload_dir=$build/Payload
+        rm -rf "$payload_dir"
+        mkdir -p "$payload_dir"
+        cp -R "$app_bundle" "$payload_dir/"
+        local ipa_path=$destination/$target.ipa
+        rm -f "$ipa_path"
+        (cd "$build" && zip -r -X -y "$ipa_path" "Payload") >/dev/null
+        rm -rf "$payload_dir"
+        product_path=$ipa_path
+    fi
 
     local code_pul_sha=null
     if [[ "$provenance_profile" == "retro-rewind" ]]; then
@@ -839,7 +862,7 @@ package_built_product() {
 }
 JSON
 
-    echo "MKWCBUILD:OUTPUT=$ipa_path"
+    echo "MKWCBUILD:OUTPUT=$product_path"
 }
 
 find_or_boot_simulator() {
