@@ -224,23 +224,29 @@ constexpr float kGyroSmoothing = 0.25f;      // exponential smoothing factor, hi
 // (kFlickBaselineSmoothing) from the raw sample, so the transient shows up on top of whatever
 // steering angle is currently held rather than requiring the phone to be level.
 //
-// Axis choice: kFlickHorizontalAxis reuses kRollAxisA (the same axis RollAngle reads for
-// left/right tilt) - a quick side-to-side shove of the phone shows up there too, just as a
-// transient riding on top of the held tilt rather than a change to it. kFlickVerticalAxis is the
-// one axis RollAngle never reads (index 2), which by elimination is the one that responds to
-// raising/lowering the phone. As with kRollSign above, the *Sign constants below are a best guess
-// pending real-device verification - flip whichever direction reads backwards, exactly like
-// kRollSign needed to be flipped once actual hardware testing showed steering was reversed.
+// Up/down is relative to the ground, not to one fixed raw axis: a stationary device always reads
+// ~1g of gravity-reaction pointing away from the ground, along whichever raw axis that happens to
+// be for the current hold (straight along the screen normal when flat on a table, split across
+// two axes when held tilted for steering) - flickBaseline (the same slow EMA) already tracks that
+// live direction, so projecting the jerk onto it gives "moved away from the ground" regardless of
+// tilt, instead of hardcoding one axis index that would only be right for one specific hold.
+// Left/right stays a fixed device-frame axis (kFlickHorizontalAxis, reusing kRollAxisA - the same
+// axis RollAngle reads for tilt) since there's no equally natural world-frame reference for it and
+// a side-to-side shove reads there fine regardless of tilt anyway. As with kRollSign above,
+// kFlickHorizontalSign/kFlickVerticalSign are a best guess pending real-device verification - flip
+// whichever direction reads backwards, exactly like kRollSign needed to be flipped once actual
+// hardware testing showed steering was reversed.
 enum class FlickDirection { None, Up, Down, Left, Right };
 
 constexpr int kFlickHorizontalAxis = kRollAxisA;
-constexpr int kFlickVerticalAxis = 2;
 constexpr float kFlickHorizontalSign = 1.0f;
 constexpr float kFlickVerticalSign = 1.0f;
 constexpr float kFlickBaselineSmoothing = 0.02f;  // slow EMA of "how the phone is currently held"
 constexpr float kFlickTriggerThreshold = 7.0f;    // m/s^2 of jerk needed to fire a direction
-constexpr float kFlickResetThreshold = 3.0f;      // must decay back below this before re-arming
 constexpr Uint64 kFlickHoldMs = 120;              // how long the synthesized D-pad press stays down
+// Minimum gap between two flick triggers. A real shake wobbles back and forth for a few hundred ms
+// before settling, so without a hard time floor one shake fired its D-pad direction several times.
+constexpr Uint64 kFlickCooldownMs = 400;
 
 struct GyroState {
     bool enabled = false;
@@ -252,11 +258,11 @@ struct GyroState {
     // Flick/trick detection state - see the constants above.
     bool hasFlickBaseline = false;
     float flickBaseline[3] = {0.0f, 0.0f, 0.0f};
-    bool flickArmed = true;
     FlickDirection activeFlick = FlickDirection::None;
-    Uint64 flickStartMs = 0;
-    float lastJerkH = 0.0f;  // debug overlay only
-    float lastJerkV = 0.0f;  // debug overlay only
+    Uint64 flickStartMs = 0;   // when activeFlick was set - drives the kFlickHoldMs press duration
+    Uint64 lastTriggerMs = 0;  // drives the kFlickCooldownMs gap between triggers
+    float lastJerkH = 0.0f;    // debug overlay only
+    float lastJerkV = 0.0f;    // debug overlay only
 };
 
 GyroState g_gyro;
@@ -289,15 +295,15 @@ const char* FlickDirectionName(FlickDirection direction) {
 
 void ResetFlickState() {
     g_gyro.hasFlickBaseline = false;
-    g_gyro.flickArmed = true;
     g_gyro.activeFlick = FlickDirection::None;
     g_gyro.flickStartMs = 0;
+    g_gyro.lastTriggerMs = 0;
 }
 
 // Called once per accelerometer sample while gyro mode is on. Maintains a slow per-axis baseline
-// (kFlickBaselineSmoothing) and fires at most one direction per physical flick, gated by a
-// trigger/reset hysteresis band (see the constants above) so a single motion can't fire twice as
-// it swings out and back.
+// (kFlickBaselineSmoothing, doubling as the live gravity-reaction direction used for the vertical
+// projection below) and fires at most one direction per physical flick, gated by kFlickCooldownMs
+// so a single shake's back-and-forth wobble can't fire more than once.
 void UpdateFlickDetection(const float data[3]) {
     if (!g_gyro.hasFlickBaseline) {
         g_gyro.flickBaseline[0] = data[0];
@@ -307,8 +313,25 @@ void UpdateFlickDetection(const float data[3]) {
         return;
     }
 
-    const float jerkH = (data[kFlickHorizontalAxis] - g_gyro.flickBaseline[kFlickHorizontalAxis]) * kFlickHorizontalSign;
-    const float jerkV = (data[kFlickVerticalAxis] - g_gyro.flickBaseline[kFlickVerticalAxis]) * kFlickVerticalSign;
+    const float rawJerk[3] = {
+        data[0] - g_gyro.flickBaseline[0],
+        data[1] - g_gyro.flickBaseline[1],
+        data[2] - g_gyro.flickBaseline[2],
+    };
+
+    // Project the raw jerk onto the live gravity-reaction direction (flickBaseline itself, before
+    // this sample updates it) to get "moved away from the ground" regardless of how the phone is
+    // currently tilted - see the block comment above the constants for why this beats a fixed axis.
+    const float baselineMagSq = g_gyro.flickBaseline[0] * g_gyro.flickBaseline[0] +
+                                 g_gyro.flickBaseline[1] * g_gyro.flickBaseline[1] +
+                                 g_gyro.flickBaseline[2] * g_gyro.flickBaseline[2];
+    float jerkV = 0.0f;
+    if (baselineMagSq > 0.01f) {
+        const float invMag = 1.0f / std::sqrt(baselineMagSq);
+        jerkV = (rawJerk[0] * g_gyro.flickBaseline[0] + rawJerk[1] * g_gyro.flickBaseline[1] +
+                 rawJerk[2] * g_gyro.flickBaseline[2]) * invMag * kFlickVerticalSign;
+    }
+    const float jerkH = rawJerk[kFlickHorizontalAxis] * kFlickHorizontalSign;
     g_gyro.lastJerkH = jerkH;
     g_gyro.lastJerkV = jerkV;
 
@@ -319,28 +342,22 @@ void UpdateFlickDetection(const float data[3]) {
         g_gyro.flickBaseline[axis] += (data[axis] - g_gyro.flickBaseline[axis]) * kFlickBaselineSmoothing;
     }
 
-    const float magH = std::fabs(jerkH);
-    const float magV = std::fabs(jerkV);
-    const float peak = std::max(magH, magV);
-
-    if (!g_gyro.flickArmed) {
-        // A flick's return-to-neutral swing can be nearly as sharp as the flick itself; without
-        // this hysteresis a single physical motion would fire twice, once each direction.
-        if (peak < kFlickResetThreshold) {
-            g_gyro.flickArmed = true;
-        }
+    const Uint64 now = SDL_GetTicks();
+    if (now - g_gyro.lastTriggerMs < kFlickCooldownMs) {
         return;
     }
 
-    if (peak < kFlickTriggerThreshold) {
+    const float magH = std::fabs(jerkH);
+    const float magV = std::fabs(jerkV);
+    if (std::max(magH, magV) < kFlickTriggerThreshold) {
         return;
     }
 
     g_gyro.activeFlick = (magH >= magV)
         ? (jerkH > 0.0f ? FlickDirection::Right : FlickDirection::Left)
         : (jerkV > 0.0f ? FlickDirection::Up : FlickDirection::Down);
-    g_gyro.flickStartMs = SDL_GetTicks();
-    g_gyro.flickArmed = false;
+    g_gyro.flickStartMs = now;
+    g_gyro.lastTriggerMs = now;
 }
 
 void CloseGyroSensor() {
@@ -522,8 +539,10 @@ void DrawDebugOverlay() {
         ImGui::Text("Gyro: enabled=%s sensor=%s neutral=%s angle=%.3f",
                      g_gyro.enabled ? "yes" : "no", g_gyro.sensor ? "open" : "closed",
                      g_gyro.hasNeutral ? "yes" : "no", static_cast<double>(g_gyro.smoothedAngle));
-        ImGui::Text("Flick: dir=%s armed=%s jerkH=%.2f jerkV=%.2f",
-                     FlickDirectionName(g_gyro.activeFlick), g_gyro.flickArmed ? "yes" : "no",
+        const Uint64 nowTicks = SDL_GetTicks();
+        const bool flickCoolingDown = (nowTicks - g_gyro.lastTriggerMs) < kFlickCooldownMs;
+        ImGui::Text("Flick: dir=%s cooldown=%s jerkH=%.2f jerkV=%.2f",
+                     FlickDirectionName(g_gyro.activeFlick), flickCoolingDown ? "yes" : "no",
                      static_cast<double>(g_gyro.lastJerkH), static_cast<double>(g_gyro.lastJerkV));
 
         ImGui::Separator();
