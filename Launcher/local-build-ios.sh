@@ -679,7 +679,21 @@ fi
 
 if (( run_configure )); then
     log_step configure-native "Configuring the iOS toolchain ($platform)"
-    "$cmake_bin" -S "$workspace/runtime" -B "$build" -G Ninja "${configure_args[@]}"
+    # --fresh (not a plain re-run on the existing cache): ios.toolchain.cmake computes
+    # CMAKE_<LANG>_FLAGS by reading and appending onto whatever's already cached, rather than
+    # overwriting it - so reconfiguring an existing build directory *without* --fresh leaves every
+    # prior configure's -target flag sitting in CMAKE_C_FLAGS/CMAKE_CXX_FLAGS/etc alongside the new
+    # one. Harmless if DEPLOYMENT_TARGET/PLATFORM never change (every accumulated copy agrees), but
+    # verified directly to silently break the moment they do: changing --deployment-target on a
+    # tree that had already been configured at the old value left both old and new -target flags on
+    # the same command line, and clang's last-flag-wins rule picked whichever was stale, so the
+    # build kept the old target regardless of what this script or Info.plist claimed. --fresh
+    # forces CMake to discard CMakeCache.txt/CMakeFiles and recompute from scratch, same as the
+    # rm -rf a few lines up already does for a build directory that does not belong to this
+    # workspace at all - this only runs on the same (already rare, fingerprint-gated) path that
+    # regenerates build.ninja from scratch anyway, so it does not add a cost the comment above this
+    # block hasn't already accepted for that path.
+    "$cmake_bin" --fresh -S "$workspace/runtime" -B "$build" -G Ninja "${configure_args[@]}"
     printf '%s' "$configure_fingerprint" > "$configure_fingerprint_file"
 else
     log_step configure-native-skip "Configure inputs unchanged for ($platform); reusing the existing CMake configuration"
