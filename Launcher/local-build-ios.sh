@@ -128,6 +128,7 @@ bundle_version="1"
 bundle_short_version="1.0"
 ios_toolchain_override=""
 skip_ipa_packaging=0
+extended_virtual_addressing=0
 force_clean_build=0
 parallel_override=0
 cmake_override=""
@@ -184,6 +185,20 @@ Usage: local-build-ios.sh --output-dir DIR [options]
                                 .app bundle straight into --output-dir (--base-output-dir too, with
                                 --profile both). Not valid with --simulator, which never packages
                                 an .ipa to begin with.
+  --extended-virtual-addressing  Ad-hoc-sign the built .app with the
+                                com.apple.developer.kernel.extended-virtual-addressing entitlement
+                                (default: off, no entitlements at all - see the file header on why
+                                this script otherwise never codesigns). Raises the total virtual
+                                address space an unentitled app is allowed to reserve, which is what
+                                a low-RAM device's "Unable to reserve the flat guest address space"
+                                crash actually runs into (not the resident-memory/jetsam ceiling -
+                                increased-memory-limit was already tried for that and had zero
+                                effect). Normal free/paid signing paths have AMFI strip any
+                                entitlement your provisioning profile doesn't cover, so this only
+                                does anything if the final install goes through something that
+                                bypasses that enforcement, e.g. TrollStore. Untested end-to-end -
+                                opt in explicitly and confirm it actually fixes the crash before
+                                relying on it.
   --force-clean-build           Discard every translation/build cache first
   --parallel N                  Pin translator threads, translated-shard job pool, and Ninja parallelism to N
   --cmake PATH / --ninja PATH   Build tools (default: on PATH)
@@ -212,6 +227,7 @@ while [[ $# -gt 0 ]]; do
         --bundle-short-version) bundle_short_version=$2; shift 2 ;;
         --ios-toolchain) ios_toolchain_override=$2; shift 2 ;;
         --skip-ipa) skip_ipa_packaging=1; shift ;;
+        --extended-virtual-addressing) extended_virtual_addressing=1; shift ;;
         --force-clean-build) force_clean_build=1; shift ;;
         --parallel) parallel_override=$2; shift 2 ;;
         --cmake) cmake_override=$2; shift 2 ;;
@@ -291,6 +307,7 @@ require_command "$ninja_bin" ninja
 require_command xcodebuild xcode
 require_command zip zip
 [[ -n "$retro_rewind_zip" ]] && require_command unzip unzip
+(( extended_virtual_addressing )) && require_command codesign codesign
 if [[ -n "$game_dump" ]]; then
     # No generic "override with --nodtool" hint (require_command's default message) - unlike this
     # script's other tools, nodtool has no prebuilt-release fetcher on macOS (NodToolProvider.cs's
@@ -715,7 +732,9 @@ log_step compile "Compiling ${targets[*]} for iOS ($platform)"
 # game data into the app (there is no on-device way to point a fresh install at a dvd_root outside
 # its own sandboxed container - see runtime_config.h's ResolvedDvdRoot), and either zip into an
 # unsigned .ipa or (--simulator) install + launch it directly. No codesign step anywhere in this
-# script, deliberately - see the file header.
+# script, deliberately - see the file header - except the one narrow, opt-in exception described at
+# --extended-virtual-addressing above: that flag ad-hoc-signs solely to embed an entitlement, not as
+# a real signing step (the user's own installer still has to do that).
 # ---------------------------------------------------------------------------
 
 case "$platform" in
@@ -819,6 +838,27 @@ PLIST
         # RuntimeNandPath::RetroRewindOverlayPath() (nand_path.h) auto-discovers it.
         log_step "bundle-retro-overlay-$target" "Bundling the Retro Rewind overlay into $target"
         rsync -a --delete "$retro_root/" "$app_bundle/RetroRewind6/"
+    fi
+
+    if (( extended_virtual_addressing )); then
+        # See --extended-virtual-addressing's help text: this ad-hoc signature exists solely to
+        # carry the entitlement in the binary's code signature for whatever installer the user
+        # points at the result (TrollStore or similar) to read - it is not a substitute for that
+        # installer's own signing step, and the entitlement does nothing at all under normal
+        # free/paid signing (AMFI strips anything your provisioning profile doesn't cover).
+        log_step "apply-entitlements-$target" "Ad-hoc signing $target with extended-virtual-addressing"
+        local entitlements_file=$build/$target.entitlements.plist
+        cat > "$entitlements_file" <<ENTITLEMENTS
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>
+ENTITLEMENTS
+        codesign --force --sign - --entitlements "$entitlements_file" "$app_bundle" >/dev/null
     fi
 }
 
