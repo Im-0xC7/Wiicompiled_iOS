@@ -196,9 +196,11 @@ Usage: local-build-ios.sh --output-dir DIR [options]
                                 effect). Normal free/paid signing paths have AMFI strip any
                                 entitlement your provisioning profile doesn't cover, so this only
                                 does anything if the final install goes through something that
-                                bypasses that enforcement, e.g. TrollStore. Untested end-to-end -
-                                opt in explicitly and confirm it actually fixes the crash before
-                                relying on it.
+                                bypasses that enforcement, e.g. TrollStore. Confirmed required on a
+                                2 GB device (iPhone SE 1st gen, iOS 14.0) - without it the flat guest
+                                memory reservation fails to even start; untested on 3 GB devices, so
+                                it's unknown whether the un-entitled ceiling is already large enough
+                                there.
   --force-clean-build           Discard every translation/build cache first
   --parallel N                  Pin translator threads, translated-shard job pool, and Ninja parallelism to N
   --cmake PATH / --ninja PATH   Build tools (default: on PATH)
