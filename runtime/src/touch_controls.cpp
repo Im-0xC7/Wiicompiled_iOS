@@ -1,4 +1,5 @@
 #include "touch_controls.h"
+#include "hle_stubs.h"
 #include "runtime_config.h"
 #include "settings_overlay.h"
 
@@ -506,7 +507,11 @@ bool WantsTouchControls() {
 
 // Flip to true to bring the debug overlay back - left in place rather than deleted since it's
 // been repeatedly useful for diagnosing touch/gyro/flick issues that aren't reproducible without a
-// real device in hand.
+// real device in hand. Also shows the CPU/present/GX-FIFO/per-thread frame timing split
+// (VI_HLE_GetFrameTimingMs, GX_HLE_ConsumeFifoFrameMs, OS_HLE_ConsumeThreadTimingMs) for
+// diagnosing slow framerate on low-end hardware where Instruments can't attach (see hle/vi.cpp) -
+// picked up mid-investigation into the iPhone SE 1st gen running under 30fps, parked for later
+// since low-end devices aren't a current priority.
 constexpr bool kShowDebugOverlay = false;
 
 // Debug aid - see DebugOverlaySnapshot above. Always visible (when kShowDebugOverlay is on)
@@ -526,6 +531,39 @@ void DrawDebugOverlay() {
                      m.safeRight, m.safeBottom);
         ImGui::Text("WantsTouchControls(): %s", WantsTouchControls() ? "true" : "false");
         ImGui::Text("IsInherentlyTouchCapable(): %s", IsInherentlyTouchCapable() ? "true" : "false");
+
+        ImGui::Separator();
+        double cpuMs = 0.0, presentMs = 0.0;
+        VI_HLE_GetFrameTimingMs(&cpuMs, &presentMs);
+        const double fifoMs = GX_HLE_ConsumeFifoFrameMs();
+        ImGui::Text("CPU (game logic + GX emit): %.1f ms", cpuMs);
+        ImGui::Text("  of which GX FIFO decode:  %.1f ms", fifoMs);
+        ImGui::Text("Present (Aurora/GPU submit): %.1f ms", presentMs);
+        ImGui::Text("Sum: %.1f ms (%.1f fps)", cpuMs + presentMs,
+                     (cpuMs + presentMs) > 0.0 ? 1000.0 / (cpuMs + presentMs) : 0.0);
+        ImGui::TextUnformatted("GX FIFO decode is a SUBSET of CPU above, not additive to it - the rest");
+        ImGui::TextUnformatted("of CPU is recompiled game logic (physics/AI/etc). Present bundles GPU");
+        ImGui::TextUnformatted("work with Aurora/Dawn's own CPU-side submit cost - large Present means");
+        ImGui::TextUnformatted("\"slow present call\", not cleanly \"GPU-bound\".");
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Per-thread CPU (also a subset of CPU above; no thread names available):");
+        auto threadTimes = OS_HLE_ConsumeThreadTimingMs();
+        std::sort(threadTimes.begin(), threadTimes.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        int shown = 0;
+        for (const auto& [threadAddr, ms] : threadTimes) {
+            if (shown >= 4) {
+                ImGui::Text("  ... %zu more", threadTimes.size() - shown);
+                break;
+            }
+            if (threadAddr == 0) {
+                ImGui::Text("  (idle/no guest thread): %.1f ms", ms);
+            } else {
+                ImGui::Text("  thread 0x%08X: %.1f ms", threadAddr, ms);
+            }
+            ++shown;
+        }
 
         ImGui::Separator();
         ImGui::TextUnformatted("Active touches:");

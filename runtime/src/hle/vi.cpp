@@ -487,6 +487,16 @@ uint32_t s_lastPacedRetraceCount = ~0u;
 // comment at the stamping site). Producer-thread only, like the memo above.
 uint64_t s_lastPresentAnchorNanos = 0;
 
+// Rough CPU-vs-present timing split for the on-screen debug overlay (touch_controls.cpp), not a
+// profiler replacement - see VI_HLE_GetFrameTimingMs's comment for exactly what each number
+// includes and doesn't. Producer-thread only, like the state above; std::atomic purely so the
+// (different-thread) ImGui overlay read can't tear a partially-written double.
+std::atomic<double> s_lastCpuFrameMs{0.0};
+std::atomic<double> s_lastPresentFrameMs{0.0};
+// Wall-clock timestamp (ns since epoch) VI_HLE_PresentFrame last returned. 0 means "no completed
+// frame yet" - the first frame after startup has no meaningful CPU span to report.
+std::atomic<uint64_t> s_lastPresentExitNanos{0};
+
 // Sleeps to the same VI retrace boundary VIWaitForRetrace targets, servicing alarms every 1 ms so audio
 // DMA and timers keep running, then delivers that retrace so guest logic starts exactly on the grid.
 void PaceToRetraceBoundary(Clock::time_point deadline) {
@@ -524,6 +534,19 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     struct SequenceGuard {
         ~SequenceGuard() { s_presentSequenceActive.store(false, std::memory_order_release); }
     } sequenceGuard;
+
+    const auto presentEntry = Clock::now();
+    const uint64_t entryNanos = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(presentEntry.time_since_epoch()).count());
+    // Everything since the previous frame's presentation finished: guest CPU game logic, GX
+    // command emission, VI/alarm/audio bookkeeping - not present-call cost. Skipped for the first
+    // frame (no prior exit timestamp to diff against).
+    const uint64_t priorExitNanos = s_lastPresentExitNanos.load(std::memory_order_relaxed);
+    if (priorExitNanos != 0) {
+        s_lastCpuFrameMs.store(static_cast<double>(entryNanos - priorExitNanos) / 1'000'000.0,
+                               std::memory_order_relaxed);
+    }
+    std::chrono::nanoseconds paceSleepDuration{0};
     Clock::time_point paceDeadline{};
     bool paceThisFrame = false;
     if (paceToRetrace) {
@@ -581,7 +604,11 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
 
     aurora_end_frame();
     if (paceThisFrame) {
+        const auto paceStart = Clock::now();
         PaceToRetraceBoundary(paceDeadline);
+        // Deliberate idle wait for a frame that finished ahead of schedule, not present/GPU cost -
+        // excluded below so a healthy, fully-paced 60 fps run doesn't read as an expensive present.
+        paceSleepDuration = Clock::now() - paceStart;
         std::lock_guard<std::mutex> lock(g_viMutex);
         s_lastPacedRetraceCount = g_vi.retraceCount;
     }
@@ -600,6 +627,29 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             g_auroraFrameActive.store(true, std::memory_order_release);
         }
     }
+
+    const auto presentExit = Clock::now();
+    const auto presentSpan = (presentExit - presentEntry) - paceSleepDuration;
+    s_lastPresentFrameMs.store(std::chrono::duration<double, std::milli>(presentSpan).count(),
+                               std::memory_order_relaxed);
+    s_lastPresentExitNanos.store(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(presentExit.time_since_epoch()).count()),
+        std::memory_order_relaxed);
+}
+
+// Rough CPU-vs-present split for the debug overlay: cpuMs is wall time between one frame's
+// presentation finishing and the next one starting (guest game logic, GX command emission, VI/
+// alarm/audio bookkeeping - everything VI_HLE_PresentFrame itself isn't), presentMs is wall time
+// inside VI_HLE_PresentFrame, minus any deliberate idle wait for a frame that finished ahead of
+// its retrace deadline. This is not a real profiler: presentMs bundles actual GPU execution time
+// together with whatever CPU-side cost Aurora/Dawn's own command encoding and submission add, so a
+// large presentMs points at "the present call", not cleanly at "the GPU" - see the crash/perf
+// discussion that motivated this for why a real Instruments trace isn't available on every device.
+// Both values are 0 until the first frame completes.
+void VI_HLE_GetFrameTimingMs(double* cpuMs, double* presentMs) {
+    if (cpuMs) *cpuMs = s_lastCpuFrameMs.load(std::memory_order_relaxed);
+    if (presentMs) *presentMs = s_lastPresentFrameMs.load(std::memory_order_relaxed);
 }
 
 // -----------------------------------------------------------------------------

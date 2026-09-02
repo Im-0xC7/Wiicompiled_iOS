@@ -1,7 +1,12 @@
 // SelectThread scheduler, OSWakeupThread and the OSMutex primitives.
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "abi_bridge.h"
 #include "memory.h"
@@ -10,6 +15,62 @@
 #include "fiber_manager.h"
 #include "runtime_log.h"
 #include "os_internal.h"
+
+namespace {
+
+// Per-guest-thread CPU time for the debug overlay (touch_controls.cpp), keyed by the guest
+// OSThread's address (its only identity available here - the base OSThread layout this HLE reads
+// from has no name field, and the game may create threads dynamically, so a fixed address->name
+// table isn't reliable). Key 0 means "no guest thread running" (the scheduler's own idle spin).
+// Guarded by a mutex even though SelectThread only ever runs on the single guest-execution
+// thread, matching this codebase's existing defensive convention elsewhere (e.g. vi.cpp's
+// g_viMutex) rather than relying on that staying true.
+std::mutex g_threadTimeMutex;
+std::unordered_map<uint32_t, uint64_t> g_threadTimeNanos;
+uint64_t g_threadTimeLastTransitionNanos = 0;
+uint32_t g_threadTimeCurrentBucket = 0;
+bool g_threadTimeHaveTransition = false;
+
+uint64_t ThreadTimingNowNanos() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Call exactly at the point control actually starts running a different guest thread (or the
+// scheduler's idle spin) - not on SelectThread's many early-return "no switch needed" paths, or
+// every accumulated span would be near-zero and meaningless. Charges the elapsed time since the
+// last transition to `fromThread`, then opens a new span for `toThread`.
+void RecordThreadTransition(uint32_t fromThread, uint32_t toThread) {
+    const uint64_t now = ThreadTimingNowNanos();
+    std::lock_guard<std::mutex> lock(g_threadTimeMutex);
+    if (g_threadTimeHaveTransition) {
+        g_threadTimeNanos[fromThread] += now - g_threadTimeLastTransitionNanos;
+    }
+    g_threadTimeLastTransitionNanos = now;
+    g_threadTimeCurrentBucket = toThread;
+    g_threadTimeHaveTransition = true;
+}
+
+}  // namespace
+
+// Consumes (resets) accumulated per-guest-thread CPU time since the last call, closing out the
+// currently-open span up to "now" first so the running thread's partial slice this frame is
+// counted immediately rather than lagging to whenever it next yields. Call once per frame.
+std::vector<std::pair<uint32_t, double>> OS_HLE_ConsumeThreadTimingMs() {
+    std::lock_guard<std::mutex> lock(g_threadTimeMutex);
+    if (g_threadTimeHaveTransition) {
+        const uint64_t now = ThreadTimingNowNanos();
+        g_threadTimeNanos[g_threadTimeCurrentBucket] += now - g_threadTimeLastTransitionNanos;
+        g_threadTimeLastTransitionNanos = now;
+    }
+    std::vector<std::pair<uint32_t, double>> result;
+    result.reserve(g_threadTimeNanos.size());
+    for (const auto& [threadAddr, nanos] : g_threadTimeNanos) {
+        result.emplace_back(threadAddr, static_cast<double>(nanos) / 1'000'000.0);
+    }
+    g_threadTimeNanos.clear();
+    return result;
+}
 
 namespace {
 void LinkMutexToThread(uint32_t threadPtr, uint32_t mutexPtr)
@@ -214,11 +275,16 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
 
     // Check if there are any runnable threads
     uint32_t reschedPending = ::Memory::Read32(kSchedulerPendingFlagAddr);
+    // Tracks which bucket (a guest OSThread address, or 0 for the idle spin below) the eventual
+    // real switch further down should charge elapsed time to - see RecordThreadTransition.
+    uint32_t switchFromThread = runningContext;
     if (reschedPending == 0) {
         // No threads to run - enter idle loop
         TryInvokeSwitchCallback(runningContext, 0, cpu);
         ::Memory::Write32(kOSRunningContextAddr, 0);
-        
+        RecordThreadTransition(switchFromThread, 0);
+        switchFromThread = 0;
+
         // Set current context to idle thread context
         OS__SetCurrentContext_801a1e70(kIdleThreadContextAddr);
         
@@ -328,7 +394,8 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
 
     // Update running context
     ::Memory::Write32(kOSRunningContextAddr, nextThread);
-    
+    RecordThreadTransition(switchFromThread, nextThread);
+
     // Set as current context
     OS__SetCurrentContext_801a1e70(nextThread);
 

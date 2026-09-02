@@ -3,6 +3,9 @@
 #include "gx_cp_decode.h"
 #include "isa/big_endian.h"
 
+#include <atomic>
+#include <chrono>
+
 // Opcode constants and the stream helpers this file shares with gx_dl.cpp /
 // gx_vertex.cpp; see gx_stream_common.h.
 using namespace GxCmd;
@@ -775,10 +778,38 @@ static bool WriteDisplayListBurst(const uint8_t* data, uint32_t sizeBytes) {
     return true;
 }
 
+namespace {
+// Cumulative time spent decoding/applying GX FIFO traffic (state changes, vertex data, draw
+// triggers - everything the guest's gather-pipe writes trigger) since the last consume. This is a
+// subset of VI_HLE_GetFrameTimingMs's "CPU" bucket (hle/vi.cpp), not a third, additive number -
+// see GX_HLE_ConsumeFifoFrameMs.
+std::atomic<uint64_t> s_fifoNanosAccum{0};
+}  // namespace
+
+// Resets the accumulator on read ("consume", not "get") so each call reports exactly one frame's
+// worth - the debug overlay call site (touch_controls.cpp) runs once per presented frame, in sync
+// with VI's own present cadence, so this and VI_HLE_GetFrameTimingMs's CPU number stay comparable
+// frame to frame without the two needing to coordinate on when a "frame" starts/ends.
+double GX_HLE_ConsumeFifoFrameMs() {
+    const uint64_t nanos = s_fifoNanosAccum.exchange(0, std::memory_order_relaxed);
+    return static_cast<double>(nanos) / 1'000'000.0;
+}
+
 extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) {
     if (data == nullptr || sizeBytes == 0) {
         return;
     }
+
+    const auto start = std::chrono::steady_clock::now();
+    struct TimingGuard {
+        std::chrono::steady_clock::time_point start;
+        ~TimingGuard() {
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            s_fifoNanosAccum.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                std::memory_order_relaxed);
+        }
+    } timingGuard{start};
 
     if (IsDisplayListActive() && WriteDisplayListBurst(data, sizeBytes)) {
         return;
