@@ -1,17 +1,38 @@
 ﻿cmake_minimum_required(VERSION 3.16)
 project(mkw_recompiled)
 
-if((NOT (WIN32 AND MINGW)) AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux") AND (NOT APPLE))
-    message(FATAL_ERROR "WiiCompiled requires Windows (LLVM-MinGW), native Linux, or an Apple platform (macOS/iOS)")
-endif()
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$" OR
    NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64|AARCH64)$")
     message(FATAL_ERROR "WiiCompiled requires 64-bit Clang targeting x86_64 or aarch64/arm64")
 endif()
+
+if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    set(MKW_PLATFORM_WINDOWS TRUE)
+elseif(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64)$")
+    # The first native macOS target is Apple Silicon. Intel and universal
+    # binaries remain future compatibility work; do not silently claim them.
+    set(MKW_PLATFORM_MACOS TRUE)
+elseif(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # ios.toolchain.cmake (PLATFORM=OS64/SIMULATORARM64, this project's iOS cross-compile path)
+    # reports APPLE=TRUE and an arm64 CMAKE_SYSTEM_PROCESSOR too, same as the native-macOS branch
+    # above - CMAKE_SYSTEM_NAME is what actually tells the two apart (it sets it to "iOS", not
+    # "Darwin"), so that check is load-bearing here, not decorative. Getting this wrong would
+    # route an iOS build through MKW_PLATFORM_MACOS-gated code below that assumes a real macOS
+    # process (e.g. the flat guest memory reservation's fixed-address strategy, which is
+    # unreachable on iOS without the Extended Virtual Addressing entitlement).
+    set(MKW_PLATFORM_IOS TRUE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64)$")
+    set(MKW_PLATFORM_LINUX TRUE)
+else()
+    message(FATAL_ERROR
+        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS/iOS arm64")
+endif()
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
 endif()
+
+option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
 
 # Preprocessor definitions that belong to this project's own code (the runtime,
 # the translated shards and the product glue) and to nothing else. They are
@@ -49,17 +70,14 @@ target_include_directories(mkw_pugixml PUBLIC third_party/pugixml)
 target_compile_features(mkw_pugixml PUBLIC cxx_std_17)
 set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
 
-# Non-Windows guest-fiber scheduling (runtime/src/fiber_manager.cpp) needs a symmetric
+# Linux guest-fiber scheduling (runtime/src/host_context.cpp) needs a symmetric
 # stackful-coroutine primitive to stand in for Win32 Fibers. libco's co_switch() transfers
 # directly to any other created coroutine, matching SwitchToFiber's semantics exactly (unlike
 # asymmetric resume/yield coroutine libraries, which would need every call site restructured).
 # Vendored from upstream (higan-emu/libco @ e18e09d, 2019-10-16, ISC license; valgrind.h is
-# separately BSD-style licensed, see third_party/libco/LICENSE) - all of libco's non-Windows
-# CPU-architecture backends are kept, even though libco.c's own preprocessor dispatch
-# (__amd64__/__i386__/__arm__/__aarch64__/etc.) only ever selects amd64.c for this project's
-# x86_64-only target (see the platform/arch check above). Windows keeps using native Fibers
-# untouched, so this target is never built there.
-if(NOT WIN32)
+# separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers
+# and macOS uses the project's x18-safe AArch64 assembly backend, so this target is Linux-only.
+if(MKW_PLATFORM_LINUX)
     add_library(mkw_libco STATIC third_party/libco/libco.c)
     add_library(mkw::libco ALIAS mkw_libco)
     target_include_directories(mkw_libco PUBLIC third_party/libco)
@@ -130,13 +148,15 @@ else()
         message(FATAL_ERROR "Requested aurora-main but ${MKW_AURORA_DIR} is missing")
     endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
-    if(WIN32)
+    if(MKW_PLATFORM_WINDOWS)
         set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
         set(TINT_BUILD_HLSL_WRITER ON CACHE BOOL "" FORCE)
         set(DAWN_USE_WINDOWS_UI OFF CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
-    elseif(APPLE)
+    elseif(MKW_PLATFORM_MACOS OR MKW_PLATFORM_IOS)
         # macOS/iOS: mirrors aurora-main's own _aurora_dawn_set_platform_backends()
         # choice for APPLE - Metal only. No Vulkan loader/MoltenVK dependency is
         # introduced; Dawn's Cocoa/UIKit surface path (BackendBinding.cpp) is shared
@@ -145,7 +165,10 @@ else()
         # is explicit: this project's CMake FORCEs these cache variables before
         # aurora-main's add_subdirectory() runs, which pre-empts aurora's own
         # auto-detection (CACHE ... INTERNAL "" without FORCE never overrides an
-        # existing value).
+        # existing value). Explicitly OR'd rather than a bare APPLE check now that
+        # MKW_PLATFORM_MACOS/MKW_PLATFORM_IOS exist as the project's own platform-name
+        # convention - see their definitions above for why CMAKE_SYSTEM_NAME, not just
+        # APPLE, is what actually distinguishes the two.
         set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
         set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
@@ -157,9 +180,9 @@ else()
         # variables before aurora-main's add_subdirectory() runs, which pre-empts aurora's
         # auto-detection (CACHE ... INTERNAL "" without FORCE never overrides an existing value).
         set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
-        set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
+        set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
     endif()
     set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
     set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -167,11 +190,13 @@ else()
     # Provide a tiny stub for DXProgrammableCapture when the SDK/PIX headers are
     # missing (common on MinGW). Dawn only includes the header; no symbols are
     # referenced when PIX isn't present.
-    set(MKW_DX_STUB_DIR "${CMAKE_BINARY_DIR}/aurora_dx_stubs")
-    if(NOT EXISTS "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h")
-        file(MAKE_DIRECTORY ${MKW_DX_STUB_DIR})
-        file(WRITE "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h"
-"#pragma once\n// Stubbed PIX capture header for Dawn; no functionality when PIX is absent.\n")
+    if(MKW_PLATFORM_WINDOWS)
+        set(MKW_DX_STUB_DIR "${CMAKE_BINARY_DIR}/aurora_dx_stubs")
+        if(NOT EXISTS "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h")
+            file(MAKE_DIRECTORY ${MKW_DX_STUB_DIR})
+            file(WRITE "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h"
+"#pragma once\n// Stubbed PIX capture header for Dawn; no functionality when PIX isn't present.\n")
+        endif()
     endif()
     # Deliberately NOT injected project-wide. Only a from-source Dawn build ever
     # includes DXProgrammableCapture.h, and this tree consumes Dawn as a prebuilt
@@ -200,7 +225,9 @@ else()
         if(TARGET ${t})
             set_target_properties(${t} PROPERTIES UNITY_BUILD OFF)
             target_compile_options(${t} PRIVATE -O3 -ffast-math -w -pipe)
-            target_include_directories(${t} PRIVATE ${MKW_DX_STUB_DIR})
+            if(MKW_PLATFORM_WINDOWS)
+                target_include_directories(${t} PRIVATE ${MKW_DX_STUB_DIR})
+            endif()
             # Aurora's own sources include Windows headers and call std::min/max;
             # they relied on the old project-wide NOMINMAX that no longer leaks
             # into this subtree, so the define is applied per target here.
@@ -245,6 +272,30 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
+if(MKW_PLATFORM_MACOS OR MKW_PLATFORM_IOS)
+    # HostContext's Apple Silicon backend (host_context.cpp's `#elif defined(__APPLE__) &&
+    # defined(__aarch64__)` branch, unconditional there - fiber_manager.cpp calls into it on
+    # every non-Windows/Linux Apple target) is implemented in a small assembly companion. It must
+    # be part of the product runtime as well as the standalone context test; otherwise the final
+    # executable is missing mkw_co_init/mkw_co_switch at link time. This is genuinely shared
+    # between macOS and iOS - it's pure AArch64 Darwin calling-convention/register-preservation
+    # code (no syscalls, no OS-version checks), and Apple's ABI reserving x18 for platform use
+    # applies identically on both.
+    enable_language(ASM)
+    list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+endif()
+if(MKW_PLATFORM_MACOS)
+    # guest_flat_memory_macos.cpp reserves the flat guest space at a FIXED address via
+    # mach_vm_allocate(..., VM_FLAGS_FIXED). That's unreachable on iOS without the Extended
+    # Virtual Addressing entitlement (see guest_flat_memory.h's g_base comment, and the commit
+    # history of guest_flat_memory.cpp/.h - this project already hit and fixed exactly this
+    # class of failure once), so iOS keeps the runtime-placed reservation in guest_flat_memory.cpp
+    # instead, same as Windows/Linux.
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
+else()
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+endif()
+set(MKW_PLATFORM_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/platform/host_platform.cpp")
 set(MKW_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.cpp")
 set(MKW_RETRO_REWIND_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/retro_rewind_product.cpp")
 # The host ISA guard is the one translation unit that must not receive the
@@ -252,25 +303,113 @@ set(MKW_RETRO_REWIND_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/retro
 # mkw_runtime_common. See cmake/PublicProducts.cmake and the file's own header.
 set(MKW_CPU_BASELINE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/host_cpu_baseline.cpp")
 list(REMOVE_ITEM SOURCES ${MKW_BASE_PRODUCT_SOURCE} ${MKW_RETRO_REWIND_PRODUCT_SOURCE}
-     ${MKW_CPU_BASELINE_SOURCE})
+     ${MKW_CPU_BASELINE_SOURCE} ${MKW_PLATFORM_SOURCE})
+
+# This deliberately small library contains host services that are safe to
+# validate before guest memory and fiber work makes a full runtime build viable.
+add_library(mkw_platform STATIC "${MKW_PLATFORM_SOURCE}")
+target_include_directories(mkw_platform PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_platform PUBLIC cxx_std_17)
+set_target_properties(mkw_platform PROPERTIES UNITY_BUILD OFF)
+
+# Keep these independent from Aurora's BUILD_TESTING option: they validate the
+# project's host-platform contracts, not Aurora's third-party test suite.
+enable_testing()
+add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")
+target_link_libraries(mkw_platform_paths_tests PRIVATE mkw_platform)
+target_compile_features(mkw_platform_paths_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_platform_paths_tests COMMAND mkw_platform_paths_tests)
+
+# HostContext deliberately keeps the platform-specific context primitive out
+# of fiber_manager.cpp. Exercise the Linux libco handoff directly so future
+# refactors cannot silently remove its headers, implementation, or link edge.
+if(MKW_PLATFORM_LINUX)
+    add_executable(mkw_linux_host_context_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp")
+    target_include_directories(mkw_linux_host_context_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/include"
+        "${CMAKE_CURRENT_LIST_DIR}/third_party/libco")
+    target_compile_features(mkw_linux_host_context_tests PRIVATE cxx_std_17)
+    target_link_libraries(mkw_linux_host_context_tests PRIVATE mkw::libco)
+    add_test(NAME mkw_linux_host_context_tests COMMAND mkw_linux_host_context_tests)
+endif()
+
+if(MKW_PLATFORM_MACOS)
+    # Exercise the Apple Silicon context ABI and the public host-memory
+    # contracts separately from translated products.
+    enable_language(ASM)
+    add_executable(mkw_macos_context_abi_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_abi_tests.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+    target_compile_features(mkw_macos_context_abi_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_context_abi_tests COMMAND mkw_macos_context_abi_tests)
+
+    add_executable(mkw_macos_host_context_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+    target_include_directories(mkw_macos_host_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_host_context_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_host_context_tests COMMAND mkw_macos_host_context_tests)
+
+    add_executable(mkw_macos_guest_flat_memory_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_guest_flat_memory_tests.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+    target_include_directories(mkw_macos_guest_flat_memory_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_guest_flat_memory_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_guest_flat_memory_tests COMMAND mkw_macos_guest_flat_memory_tests)
+endif()
 
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
 # files and of optional Retro Rewind artifacts such as code.map.
-set(MKW_TRANSLATED_SHARD_MANIFEST
-    "${CMAKE_CURRENT_LIST_DIR}/../generated/build_shards/shards.cmake"
-    CACHE FILEPATH "Translator-owned aggregate shard manifest")
-if(NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
-    message(FATAL_ERROR
-        "Missing translator-owned shard manifest: ${MKW_TRANSLATED_SHARD_MANIFEST}. "
-        "Run Translator.Cli emit-build-shards first; see translator/README.md.")
-endif()
-include("${MKW_TRANSLATED_SHARD_MANIFEST}")
-set(MKW_HAVE_RETRO_REWIND ${MKW_HAVE_RETRO_REWIND_SHARDS})
-message(STATUS
-    "Translator graph: ${MKW_SHARED_BASE_FUNCTION_COUNT}/${MKW_BASE_FUNCTION_COUNT} base functions shared; "
-    "${MKW_PROFILE_SENSITIVE_CALLER_COUNT} profile-sensitive callers; "
-    "${MKW_RETRO_REWIND_FUNCTION_COUNT} Retro Rewind functions")
+if(MKW_BUILD_PRODUCTS)
+    set(MKW_TRANSLATED_SHARD_MANIFEST
+        "${CMAKE_CURRENT_LIST_DIR}/../generated/build_shards/shards.cmake"
+        CACHE FILEPATH "Translator-owned aggregate shard manifest")
+    # The prebuilt export only needs the aurora/third-party closure configured above, so a
+    # packaging machine without a translation stops here instead of failing.
+    if(MKW_NATIVE_PREBUILT_EXPORT_DIR AND NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
+        message(STATUS "No translator shard manifest; configuring the native prebuilt export only")
+        return()
+    endif()
+    if(NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
+        message(FATAL_ERROR
+            "Missing translator-owned shard manifest: ${MKW_TRANSLATED_SHARD_MANIFEST}. "
+            "Run Translator.Cli emit-build-shards first; see translator/README.md.")
+    endif()
+    include("${MKW_TRANSLATED_SHARD_MANIFEST}")
+    set(MKW_HAVE_RETRO_REWIND ${MKW_HAVE_RETRO_REWIND_SHARDS})
+    message(STATUS
+        "Translator graph: ${MKW_SHARED_BASE_FUNCTION_COUNT}/${MKW_BASE_FUNCTION_COUNT} base functions shared; "
+        "${MKW_PROFILE_SENSITIVE_CALLER_COUNT} profile-sensitive callers; "
+        "${MKW_RETRO_REWIND_FUNCTION_COUNT} Retro Rewind functions")
 
-set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
-include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
+    set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
+else()
+    if(MKW_PLATFORM_MACOS)
+        # Compile-only audit of native runtime sources. It deliberately avoids
+        # translated products until their host dependencies are portable.
+        # These sources depend on generated/RuntimeConfig.h, which is emitted for
+        # a particular game by the translator and is intentionally unavailable
+        # in this platform-only configuration.
+        set(MKW_MACOS_NATIVE_AUDIT_SOURCES ${SOURCES})
+        list(REMOVE_ITEM MKW_MACOS_NATIVE_AUDIT_SOURCES
+            "${CMAKE_CURRENT_LIST_DIR}/src/abi_bridge.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/hle/os/os_alarm.cpp")
+        add_library(mkw_macos_native_compile OBJECT ${MKW_MACOS_NATIVE_AUDIT_SOURCES})
+        target_include_directories(mkw_macos_native_compile PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src"
+            "${CMAKE_CURRENT_LIST_DIR}/.." "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
+        target_compile_features(mkw_macos_native_compile PRIVATE cxx_std_20)
+        target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
+        target_link_libraries(mkw_macos_native_compile PRIVATE
+            aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
+            mkw::pugixml mkw::toml11 mkw::cryptopp)
+        set_target_properties(mkw_macos_native_compile PROPERTIES UNITY_BUILD OFF)
+    endif()
+    add_custom_target(mkw_platform_paths_check DEPENDS mkw_platform)
+    message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
+endif()

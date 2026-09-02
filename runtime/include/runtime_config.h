@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 #include <toml.hpp>
+#include "platform/host_platform.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -55,6 +57,25 @@ struct RuntimeUserConfig {
     std::optional<bool> audioMuted;
     std::optional<bool> audioMixWorker;
     std::optional<bool> attenuateMusicWhenMediaPlays;
+    // Real Wii Remotes (with or without Nunchuk / Classic Controller) and Wii U Pro
+    // Controllers paired over Bluetooth, driven by SDL's HIDAPI Wii driver. The driver
+    // is opt-in on SDL's side, so this decides whether the runtime turns it on.
+    std::optional<bool> wiiRemotes;
+    // Keep re-enumerating Bluetooth HID devices while no Wii controller is connected
+    // (Dolphin's "continuous scanning"), so a remote that dropped or was switched on
+    // after launch shows up without restarting.
+    std::optional<bool> wiiContinuousScan;
+    // Accelerometer zero-point correction for the Bluetooth Wii Remote, in g and in
+    // SDL's sensor frame (x right, y out of the button face, z towards the user).
+    // SDL's Wii driver falls back to a nominal zero point when its read of the
+    // remote's calibration block times out (common over Bluetooth), so this is
+    // measured in the overlay with the remote at rest.
+    std::optional<double> wiiAccelOffsetX;
+    std::optional<double> wiiAccelOffsetY;
+    std::optional<double> wiiAccelOffsetZ;
+    // Debugging aid: append every KPAD sample of the Bluetooth remote (raw and
+    // corrected accelerometer, buttons) to wii_accel_trace.csv next to Config.toml.
+    std::optional<bool> wiiAccelTrace;
     std::optional<bool> networkEnabled;
     std::optional<bool> discordPresenceEnabled;
     // The application ID of the WiiCompiled Discord application. This is only
@@ -146,7 +167,14 @@ inline bool IsSupportedResolutionMultiplier(float value) {
 // Must stay in step with the backend table in main.cpp, which is what actually
 // maps these to AuroraBackend.
 inline bool IsSupportedGraphicsApi(std::string_view value) {
+#if defined(__APPLE__)
+    static constexpr std::array<std::string_view, 2> values{"auto", "metal"};
+// only vulkan for linux
+#elif defined(__linux__)
+    static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
+#elif defined(_WIN32)
     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+#endif
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
@@ -178,25 +206,11 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
         buffer.resize(buffer.size() * 2);
     }
 #elif defined(__APPLE__)
-    // Darwin (macOS and iOS, device and simulator alike) has no /proc at all, so the Linux
-    // branch's magic symlink doesn't apply here. _NSGetExecutablePath is the Darwin equivalent of
-    // GetModuleFileNameW/readlink("/proc/self/exe"): it fails with the required size the first
-    // time if the buffer is too small, so this grows the buffer exactly once from that answer
-    // rather than doubling blindly, the same "ask the OS how big a buffer to bring" pattern
-    // GetModuleFileNameW's loop converges toward.
-    uint32_t size = 256;
-    std::string buffer(size, '\0');
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
-        buffer.resize(size);
-        if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
-            return std::nullopt;
-        }
-    }
-    const auto nulPosition = buffer.find('\0');
-    if (nulPosition != std::string::npos) {
-        buffer.resize(nulPosition);
-    }
-    return std::filesystem::path(buffer).parent_path();
+    // Also covers iOS (device and simulator): _NSGetExecutablePath is the Darwin equivalent of
+    // GetModuleFileNameW/readlink("/proc/self/exe") on every Apple platform, sandboxed or not -
+    // RuntimePlatform's implementation (platform/host_platform.cpp) uses the same API this fork's
+    // own inline version used before upstream centralized it here.
+    return RuntimePlatform::ExecutableDirectory();
 #else
     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
@@ -255,19 +269,15 @@ inline std::filesystem::path ApplicationDataDirectory() {
         return directory;
     }
 #elif defined(__APPLE__)
-    // ~/Library/Application Support is Apple's own per-app data directory convention (what
-    // NSApplicationSupportDirectory/FileManager .applicationSupportDirectory resolve to) - the
-    // XDG-style $HOME/.local/share path below works fine on unsandboxed macOS but is flatly
-    // denied (EPERM) by the iOS App Sandbox: HOME points at the app's container, but only its
-    // designated subdirectories (Documents, Library, tmp) are actually writable - creating a new
-    // top-level ".local" entry directly in the container root is exactly the kind of write the
-    // sandbox exists to block. Verified on-device, not just believed from docs; this is used
-    // uniformly on every Apple platform rather than only iOS since it is the correct convention
-    // on macOS too, not merely a workaround.
-    if (const char* home = std::getenv("HOME"); home && *home) {
-        return std::filesystem::path(home) / "Library" / "Application Support" /
-               kApplicationDirectoryName;
-    }
+    // Also covers iOS (device and simulator): RuntimePlatform::ApplicationDataDirectory
+    // (platform/host_platform.cpp) uses $HOME/Library/Application Support - Apple's own per-app
+    // data directory convention (what NSApplicationSupportDirectory resolves to), and the one
+    // that's actually writable under the iOS App Sandbox. The XDG-style $HOME/.local/share path
+    // in the #else branch below is flatly denied (EPERM) there: HOME points at the app's
+    // container, but only its designated subdirectories (Documents, Library, tmp) are writable -
+    // a new top-level ".local" entry in the container root is exactly what the sandbox blocks.
+    // Verified on-device, not just believed from docs.
+    return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
 #else
     // XDG Base Directory spec equivalent of FOLDERID_LocalAppData: $XDG_DATA_HOME if set and
     // non-empty, otherwise its default of $HOME/.local/share.
@@ -402,6 +412,7 @@ inline void AppendOverlayRoots(RuntimeUserConfig& config, const std::string& roo
     }
 }
 
+// Reads every supported setting out of a parsed Config.toml document.
 inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     RuntimeUserConfig config;
 
@@ -469,6 +480,12 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.audioMixWorker = FindConfigValue<bool>(document, "audio", "mix_worker");
     config.attenuateMusicWhenMediaPlays =
         FindConfigValue<bool>(document, "audio", "attenuate_music_when_media_plays");
+    config.wiiRemotes = FindConfigValue<bool>(document, "controller", "wii_remotes");
+    config.wiiContinuousScan = FindConfigValue<bool>(document, "controller", "wii_continuous_scan");
+    config.wiiAccelOffsetX = FindConfigValue<double>(document, "controller", "wii_accel_offset_x");
+    config.wiiAccelOffsetY = FindConfigValue<double>(document, "controller", "wii_accel_offset_y");
+    config.wiiAccelOffsetZ = FindConfigValue<double>(document, "controller", "wii_accel_offset_z");
+    config.wiiAccelTrace = FindConfigValue<bool>(document, "controller", "wii_accel_trace");
     config.networkEnabled = FindConfigValue<bool>(document, "network", "enabled");
     config.discordPresenceEnabled = FindConfigValue<bool>(document, "discord", "enabled");
     config.discordClientId = FindConfigValue<std::string>(document, "discord", "client_id");
@@ -805,14 +822,75 @@ inline bool AudioMixWorkerEnabled(bool fallback = true) {
     return Get().audioMixWorker.value_or(fallback);
 }
 
+// Whether background music should duck automatically for other media playback.
 inline bool AttenuateMusicWhenMediaPlays(bool fallback = false) {
     return Get().attenuateMusicWhenMediaPlays.value_or(fallback);
 }
 
+// Bluetooth Wii Remotes / Wii U Pro Controllers. Read once before SDL's joystick
+// subsystem comes up, so a change only takes effect on the next launch.
+inline bool WiiRemotesEnabled(bool fallback = true) {
+    return Get().wiiRemotes.value_or(fallback);
+}
+
+// Persists the Bluetooth Wii Remote driver switch.
+inline bool SetWiiRemotesEnabled(bool value) {
+    Mutable().wiiRemotes = value;
+    return WriteSetting("controller", "wii_remotes", value ? "true" : "false");
+}
+
+// Whether to keep rescanning Bluetooth while no Wii controller is connected.
+inline bool WiiContinuousScanEnabled(bool fallback = true) {
+    return Get().wiiContinuousScan.value_or(fallback);
+}
+
+// Persists the continuous scanning switch.
+inline bool SetWiiContinuousScanEnabled(bool value) {
+    Mutable().wiiContinuousScan = value;
+    return WriteSetting("controller", "wii_continuous_scan", value ? "true" : "false");
+}
+
+// Wii Remote accelerometer zero-point correction (g, SDL sensor frame); all zero
+// when the remote has not been calibrated.
+inline std::array<double, 3> WiiAccelOffset() {
+    const RuntimeUserConfig& config = Get();
+    return {config.wiiAccelOffsetX.value_or(0.0), config.wiiAccelOffsetY.value_or(0.0),
+            config.wiiAccelOffsetZ.value_or(0.0)};
+}
+
+// Whether to write the per-frame accelerometer trace (off unless asked for).
+inline bool WiiAccelTraceEnabled(bool fallback = false) {
+    return Get().wiiAccelTrace.value_or(fallback);
+}
+
+// True while a non-zero correction is stored ("Clear calibration" writes zeros).
+inline bool HasWiiAccelOffset() {
+    const std::array<double, 3> offset = WiiAccelOffset();
+    return offset[0] != 0.0 || offset[1] != 0.0 || offset[2] != 0.0;
+}
+
+// Persists the accelerometer correction measured by the overlay's calibration.
+inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
+    Mutable().wiiAccelOffsetX = offset[0];
+    Mutable().wiiAccelOffsetY = offset[1];
+    Mutable().wiiAccelOffsetZ = offset[2];
+    bool ok = true;
+    const char* keys[3] = {"wii_accel_offset_x", "wii_accel_offset_y", "wii_accel_offset_z"};
+    for (size_t i = 0; i < 3; ++i) {
+        // Always a float literal, so a whole-number offset does not come back as a TOML integer.
+        std::ostringstream formatted;
+        formatted << std::fixed << std::setprecision(4) << offset[i];
+        ok = WriteSetting("controller", keys[i], formatted.str()) && ok;
+    }
+    return ok;
+}
+
+// Target frame rate for frame interpolation, or 0 to disable it.
 inline uint32_t FrameInterpolationFps(uint32_t fallback = 0) {
     return Get().frameInterpolationFps.value_or(fallback);
 }
 
+// Whether to skip draws whose graphics pipeline has not finished compiling yet.
 inline bool SkipUnreadyPipelines(bool fallback = true) {
     return Get().skipUnreadyPipelines.value_or(fallback);
 }

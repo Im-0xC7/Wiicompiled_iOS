@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "hle/controller_status_contract.h"
 #include "touch_controls.h"
+#include "wii_remote_input.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -38,6 +39,7 @@ extern "C" uint32_t PAD__Init_HLE()
 }
 PPC_NATIVE_OVERRIDE(801AF2F0, PAD__Init_HLE, uint32_t, (), ());
 
+// PADRead: gathers every GameCube pad source for the frame and writes the statuses to guest memory.
 extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 {
     if (statusPtr == 0) {
@@ -45,7 +47,17 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
     }
 
     PADStatus statuses[PAD_CHANMAX]{};
+    // Keep looking for a Bluetooth Wii Remote that dropped out (or was turned on late).
+    WiiRemoteInput::Poll();
     uint32_t rumbleMask = PADRead(statuses);
+    // Wii Remotes reach the game through KPAD, not as GameCube pads. This also
+    // applies while input is blocked (overlay open) so the port does not flip
+    // between "connected" and "no controller" every time the overlay toggles.
+    WiiRemoteInput::HideRemotesFromPad(statuses, PAD_CHANMAX);
+    // Must run after HideRemotesFromPad: ApplyOverlay is the final authoritative merge for
+    // touch/gyro input (it unconditionally sets port 0's err back to PAD_ERR_NONE and ORs its own
+    // button bits on top), so if it ran first and port 0 happened to be a KPAD-served remote
+    // channel, HideRemotesFromPad would zero it right back out and silently drop touch input.
     touch_controls::ApplyOverlay(statuses, PAD_CHANMAX);
 
     try {

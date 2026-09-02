@@ -28,7 +28,9 @@ internal static class AssemblyBlobWriter
         // Mach-O segment/section pair (__TEXT,__const is what clang itself emits for `const`
         // globals). The build always targets whichever platform the translator itself runs on
         // (there is no cross-compilation support), so that's what this picks the section syntax
-        // from.
+        // from - this is also why an iOS cross-compile target gets Mach-O output here: the
+        // translator always runs natively on the macOS dev machine regardless of what the
+        // downstream C++ build eventually targets.
         assembly.AppendLine(OperatingSystem.IsWindows()
             ? ".section .rdata,\"dr\""
             : OperatingSystem.IsMacOS()

@@ -23,6 +23,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -38,17 +42,11 @@
 #include <dbghelp.h>
 #else
 #include <signal.h>
-#if defined(__APPLE__)
-// macOS's <ucontext.h> refuses to declare the ucontext_t/mcontext_t types (read-only here, for
-// the crash handler's fault-address reporting - nothing in this file calls the actual
-// get/make/swapcontext functions the guard is really gatekeeping) unless _XOPEN_SOURCE opts into
-// the deprecated POSIX ucontext API. Scoped to just this include and then undone immediately so
-// it doesn't change what any other unity-combined source file in this translation unit sees from
-// the system headers it includes later.
-#define _XOPEN_SOURCE 600
-#include <ucontext.h>
-#undef _XOPEN_SOURCE
-#else
+#if defined(__x86_64__)
+// Only the x86 POSIX fault path (PosixMemoryFaultHandler below) inspects ucontext_t to recover
+// the page-fault write bit (uc_mcontext.gregs[REG_ERR]) - the arm64 handler (macOS and iOS alike)
+// does not use it at all, so this stays scoped to x86_64 rather than pulling in Apple's deprecated
+// ucontext API (which needs _XOPEN_SOURCE just to declare ucontext_t/mcontext_t) for nothing.
 #include <ucontext.h>
 #endif
 #include <unistd.h>
@@ -77,6 +75,7 @@
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "aurora_events.h"
+#include "wii_remote_input.h"
 #include "discord_presence.h"
 #include "fiber_manager.h"
 #include "hle_stubs.h"
@@ -1320,6 +1319,7 @@ static void TerminateHandler() {
     std::_Exit(EXIT_FAILURE);
 }
 
+// Runtime entry point: loads the configuration, brings up aurora and runs the game.
 int RuntimeMain(int argc, char** argv) {
     // Must run before the transcript duplicates stdout/stderr: it decides what
     // those descriptors are mirrored to now that the products are GUI-subsystem.
@@ -1398,9 +1398,21 @@ int RuntimeMain(int argc, char** argv) {
             const char* configName;
             AuroraBackend backend;
         };
+#if defined(__APPLE__)
+        static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"metal", BACKEND_METAL},
+        }};
+// only vulkan for linux
+#elif defined(__linux__)
+            static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},
+        }};
+#elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
         }};
+
+#endif
         const auto backendDisplayName = [](AuroraBackend value) -> const char* {
             for (const auto& entry : kGraphicsBackends) {
                 if (entry.backend == value) {
@@ -1418,6 +1430,11 @@ int RuntimeMain(int argc, char** argv) {
             }
         }
         const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
+
+        // SDL only reads its Wii driver hint when the joystick subsystem starts, which
+        // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be
+        // visible on that first scan.
+        WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
 
         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
         if (requestedBackend != BACKEND_AUTO && auroraInfo.backend != requestedBackend) {
