@@ -197,7 +197,12 @@ constexpr std::array<std::string_view, 3> kDisplayModeConfigNames = {
 uint64_t g_presentedFrame = 0;
 std::atomic_bool g_strapInputAccepted = false;
 std::atomic_uint64_t g_startupDismissFrame = UINT64_MAX;
-constexpr uint64_t kStrapTransitionCoverFrames = 60;
+// The strap screen is accepted the instant it becomes eligible, so the frames
+// it would have spent waiting for A are still rendered underneath this cover.
+// One second was not enough on an Apple TV 4K or an iPhone loading from the
+// app container: the scene change landed after the cover lifted and the strap
+// warning flashed through. Three seconds covers the slowest device measured.
+constexpr uint64_t kStrapTransitionCoverFrames = 180;
 
 constexpr std::array<ResolutionItem, 9> kResolutions = {{
     {"Auto (window size)", 0.0f}, {"0.5x", 0.5f}, {"Native (1x)", 1.0f}, {"1.5x", 1.5f},
