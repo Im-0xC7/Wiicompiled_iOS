@@ -198,9 +198,9 @@ std::atomic_bool g_strapInputAccepted = false;
 std::atomic_uint64_t g_startupDismissFrame = UINT64_MAX;
 constexpr uint64_t kStrapTransitionCoverFrames = 60;
 
-constexpr std::array<ResolutionItem, 8> kResolutions = {{
-    {"Auto (window size)", 0.0f}, {"Native (1x)", 1.0f}, {"1.5x", 1.5f}, {"2x", 2.0f},
-    {"3x", 3.0f}, {"4x", 4.0f}, {"6x", 6.0f}, {"8x", 8.0f},
+constexpr std::array<ResolutionItem, 9> kResolutions = {{
+    {"Auto (window size)", 0.0f}, {"0.5x", 0.5f}, {"Native (1x)", 1.0f}, {"1.5x", 1.5f},
+    {"2x", 2.0f}, {"3x", 3.0f}, {"4x", 4.0f}, {"6x", 6.0f}, {"8x", 8.0f},
 }};
 
 constexpr std::array<uint32_t, 3> kFrameInterpolationTargetFps{0, 120, 180};
@@ -937,13 +937,14 @@ void NotifyStrapInputAccepted() noexcept {
 
 void AdvancePresentedFrame() noexcept { ++g_presentedFrame; }
 
-// Steps through a short {1x, 2x, 4x} cycle rather than the desktop menu's full preset list (which
-// also includes Auto/1.5x/3x/6x/8x) - a quick touch tap should reach a meaningfully higher
-// resolution within a couple of presses, not require stepping through every preset. If the current
-// scale isn't one of these three (e.g. set to 1.5x from the desktop menu), resets to the first step
-// rather than searching for a "nearest" one, so the button's behavior stays simple to predict.
+// Steps through a short {0.5x, 1x, 2x, 4x} cycle rather than the desktop menu's full preset list
+// (which also includes Auto/1.5x/3x/6x/8x) - a quick touch tap should reach a meaningfully higher
+// (or, on underpowered hardware, lower) resolution within a couple of presses, not require
+// stepping through every preset. If the current scale isn't one of these four (e.g. set to 1.5x
+// from the desktop menu), resets to the first step rather than searching for a "nearest" one, so
+// the button's behavior stays simple to predict.
 void CycleResolutionScale() noexcept {
-    constexpr std::array<float, 3> kTouchResolutionCycle = {1.0f, 2.0f, 4.0f};
+    constexpr std::array<float, 4> kTouchResolutionCycle = {0.5f, 1.0f, 2.0f, 4.0f};
     size_t next = 0;
     for (size_t i = 0; i < kTouchResolutionCycle.size(); ++i) {
         if (std::fabs(kTouchResolutionCycle[i] - g_resolutionScale) < 0.001f) {
