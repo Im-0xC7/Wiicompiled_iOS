@@ -155,6 +155,66 @@ translator without any game data around.
 For everything beyond that, feeding in your own `main.dol`/`StaticR.rel`, running the
 translation, generating the manifest and build graph, and compiling. see [`translator/README.md`](translator/README.md).
 
+## iOS
+
+This fork (`ios-port` branch) adds a sideloadable iOS build on top of everything above - same
+static-recompilation runtime, same 100% physics accuracy, running on an iPhone/iPad instead of
+Windows/macOS/Linux. It isn't merged upstream and isn't part of the Wheel Wizard install path
+described above; everything here is driven by one script, `Launcher/local-build-ios.sh`.
+
+### Requirements
+
+- macOS with Xcode installed (not just the Command Line Tools - the iOS SDK ships with Xcode)
+- Your own legally dumped, clean PAL `RMCP01` disc image, same rule as everywhere else in this doc
+- A way to get an unsigned `.ipa` onto a device: a free or paid Apple Developer account with
+  AltStore/Sideloadly, or TrollStore where your iOS version supports it - see the caution below
+- iOS 14.0+ (the script's default floor; confirmed booting on real devices at both 14.0 and 14.8)
+
+> [!CAUTION]
+> `Launcher/local-build-ios.sh` produces a genuinely **unsigned** `.ipa`. Every install path (a
+> paid Apple Developer account, AltStore/Sideloadly, TrollStore) needs your own signing step - the
+> script deliberately stops at the last thing it can actually automate.
+
+### Quick iteration: the Simulator
+
+No signing needed at all. Builds, installs, and launches straight into a booted (or freshly
+booted) iOS Simulator, console streamed live:
+
+```bash
+Launcher/local-build-ios.sh --simulator --game /path/to/your/mario_kart_wii.iso
+```
+
+`--game` only needs to be passed once; later runs reuse whatever's already extracted into `Assets/`.
+
+### Building the real `.ipa`
+
+```bash
+Launcher/local-build-ios.sh --output-dir ./build-ios --game /path/to/your/mario_kart_wii.iso
+```
+
+Add `--profile retro-rewind --retro-rewind-zip /path/to/RetroRewind6.zip` (or `--retro-rewind-dir`
+for an already-extracted folder) for a Retro Rewind build, or `--profile both` with
+`--base-output-dir` to produce both products in one run.
+
+### Low-RAM devices (2/3GB)
+
+Older or cheaper devices can hit `Unable to reserve the flat guest address space` on boot: iOS
+caps the total virtual address space an unentitled app can reserve, and that ceiling appears to
+scale with the device's physical RAM. Pass `--extended-virtual-addressing` to sign the build with
+the `com.apple.developer.kernel.extended-virtual-addressing` entitlement, which raises that
+ceiling - but only an install path that bypasses normal entitlement enforcement (TrollStore) can
+actually grant it; a free or paid signing certificate alone won't do anything. Confirmed required
+on a 2 GB device (iPhone SE 1st gen); untested whether 3 GB devices need it too.
+
+### Everything else
+
+```bash
+Launcher/local-build-ios.sh --help
+```
+
+covers the deployment target floor, bundle ID/name/version, Retro-WFC payload options, `--skip-ipa`
+(copy the plain `.app` instead of zipping one), and build-tool overrides.
+
 ## FAQ
 
 **Is this an emulator?**
